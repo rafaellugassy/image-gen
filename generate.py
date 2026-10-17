@@ -13,7 +13,6 @@ again when done). Start it yourself with run_comfyui.ps1 to keep models loaded
 between runs.
 """
 import argparse
-import copy
 import json
 import random
 import subprocess
@@ -103,89 +102,157 @@ def build_workflow(profile: dict, prompt: str, negative: str, width, height,
     return w
 
 
+def _get_flux3_system_prompt(tpl_path: Path) -> str:
+    """Extract the t2i system prompt string from the workflow JSON."""
+    wf = json.loads(tpl_path.read_text(encoding="utf-8"))
+    for sg in wf.get("definitions", {}).get("subgraphs", []):
+        for node in sg.get("nodes", []):
+            if node.get("title") == "System prompt: plain (t2i)":
+                wvn = node.get("widgets_values_named") or {}
+                return wvn.get("value", node.get("widgets_values", [""])[0])
+    return ""
+
+
 def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
                          width: Optional[int], height: Optional[int],
                          prefix: str, images: Optional[list] = None) -> dict:
-    """Load the official FLUX.3 klein workflow JSON and inject runtime values.
+    """Build a flat ComfyUI API-format prompt for FLUX.3 klein.
+
+    Expands the subgraph definitions from the official workflow JSONs into
+    primitive nodes that the /prompt API endpoint understands directly.
 
     images: list of filenames already uploaded to ComfyUI's input folder.
-    - 0 images → text-to-image workflow
-    - 1 image   → image-to-image workflow
-    - 2-4 images → multi-image-to-image workflow
+    - 0 images → text-to-image
+    - 1 image   → image-to-image  (ReferenceMultiLatent with 1 image)
+    - 2-4 images → multi-image-to-image
     """
     images = images or []
-    n = len(images)
-    if n == 0:
-        tpl_path = FLUX3_WORKFLOWS / "flux3_klein_int8_t2i.json"
-    elif n == 1:
-        tpl_path = FLUX3_WORKFLOWS / "flux3_klein_int8_i2i.json"
+    n_images = len(images)
+    w = width or 1024
+    h = height or 1024
+    alpha = 16.0   # timestep shift; model reference is 6.93
+    t2i_tpl = FLUX3_WORKFLOWS / "flux3_klein_int8_t2i.json"
+    system_prompt = _get_flux3_system_prompt(t2i_tpl)
+
+    # ── Prompt upsampler ──────────────────────────────────────────────────────
+    # 1  CLIPLoader for the upsampler LLM
+    # 2  TextGenerate: produces an expanded caption from the short user prompt
+    # ── Diffusion ─────────────────────────────────────────────────────────────
+    # 3  UNETLoader
+    # 4  CLIPLoader (text encoder for the diffusion model)
+    # 5  VAELoader
+    # 6  CLIPTextEncode (positive, fed the upsampled prompt)
+    # 7  CLIPTextEncode (negative, empty — cfg=1 distilled)
+    # 8  EmptyFlux2LatentImage  (t2i) / image path (i2i)
+    # 9  PrimitiveFloat (alpha)
+    # 10 ComfyMathExpression (mu = ln(alpha))
+    # 11 ModelSamplingFlux (timestep shift)
+    # 12 KSampler
+    # 13 VAEDecode
+    # 14 SaveImage
+    # For i2i: add LoadImage + ImageScaleToTotalPixels + VAEEncode + ReferenceMultiLatent
+
+    p: dict = {}
+
+    # Upsampler CLIP loader
+    p["1"] = {"class_type": "CLIPLoader", "inputs": {
+        "clip_name": profile["upsampler"], "type": "flux3", "device": "default"}}
+
+    # TextGenerate: upsampler LLM
+    p["2"] = {"class_type": "TextGenerate", "inputs": {
+        "clip": ["1", 0],
+        "system_prompt": system_prompt,
+        "prompt": prompt,
+        "max_length": 3584,
+        "sampling_mode": "on",
+        "sampling_mode.temperature": 1,
+        "sampling_mode.top_k": 1,
+        "sampling_mode.top_p": 0.95,
+        "sampling_mode.min_p": 0,
+        "sampling_mode.repetition_penalty": 1,
+        "sampling_mode.seed": seed,
+        "sampling_mode.presence_penalty": 1.5,
+        "thinking": False,
+        "use_default_template": True,
+        "mtp": "off",
+    }}
+
+    # Diffusion model loaders
+    p["3"] = {"class_type": "UNETLoader", "inputs": {
+        "unet_name": profile["unet"], "weight_dtype": "default"}}
+    p["4"] = {"class_type": "CLIPLoader", "inputs": {
+        "clip_name": profile["clip"], "type": "flux3", "device": "default"}}
+    p["5"] = {"class_type": "VAELoader", "inputs": {"vae_name": profile["vae"]}}
+
+    # Text conditioning — positive uses the upsampled prompt output
+    p["6"] = {"class_type": "CLIPTextEncode", "inputs": {
+        "clip": ["4", 0], "text": ["2", 0]}}
+    p["7"] = {"class_type": "CLIPTextEncode", "inputs": {
+        "clip": ["4", 0], "text": ""}}
+
+    # Timestep shift
+    p["9"]  = {"class_type": "PrimitiveFloat",        "inputs": {"value": alpha}}
+    p["10"] = {"class_type": "ComfyMathExpression",   "inputs": {
+        "values.a": ["9", 0], "expression": "log(a)"}}
+    p["11"] = {"class_type": "ModelSamplingFlux",     "inputs": {
+        "model": ["3", 0], "max_shift": ["10", 0], "base_shift": ["10", 0]}}
+
+    if n_images == 0:
+        # t2i: plain empty latent
+        p["8"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
+            "width": w, "height": h, "batch_size": 1}}
+        latent_src = ["8", 0]
     else:
-        tpl_path = FLUX3_WORKFLOWS / "flux3_klein_int8_mi2i.json"
+        # i2i / mi2i: load + scale each image, feed into ReferenceMultiLatent
+        ref_inputs: dict = {
+            "positive": ["6", 0],
+            "negative": ["7", 0],
+            "vae":      ["5", 0],
+        }
+        for idx, img_name in enumerate(images[:4]):
+            load_id  = str(20 + idx * 3)
+            scale_id = str(21 + idx * 3)
+            enc_id   = str(22 + idx * 3)
+            p[load_id]  = {"class_type": "LoadImage", "inputs": {
+                "image": img_name, "upload": "image"}}
+            p[scale_id] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
+                "image": [load_id, 0], "upscale_method": "lanczos",
+                "megapixels": 1.0, "resolution_steps": 1}}
+            p[enc_id]   = {"class_type": "VAEEncode", "inputs": {
+                "pixels": [scale_id, 0], "vae": ["5", 0]}}
+            ref_inputs[f"images.image{idx}"] = [enc_id, 0]
 
-    wf = copy.deepcopy(json.loads(tpl_path.read_text(encoding="utf-8")))
+        # Output size: match first image
+        p["50"] = {"class_type": "GetImageSize", "inputs": {"image": ["21", 0]}}
+        p["51"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
+            "width":  w if width else ["50", 0],
+            "height": h if height else ["50", 1],
+            "batch_size": 1}}
 
-    for node in wf["nodes"]:
-        nid = node["id"]
-        wvn = node.get("widgets_values_named")
-        wv = node.get("widgets_values")
+        p["52"] = {"class_type": "ReferenceMultiLatent", "inputs": ref_inputs}
+        p["53"] = {"class_type": "RepeatLatentBatch", "inputs": {
+            "samples": ["52", 0], "amount": 1}}
+        latent_src = ["53", 0]
 
-        # Prompt text node
-        if node.get("type") == "PrimitiveStringMultiline" and node.get("title") == "Prompt":
-            wv[0] = prompt
-            if wvn is not None:
-                wvn["STRING"] = prompt
+    # KSampler
+    p["12"] = {"class_type": "KSampler", "inputs": {
+        "model":        ["11", 0],
+        "positive":     ["6", 0],
+        "negative":     ["7", 0],
+        "latent_image": latent_src,
+        "seed":         seed,
+        "steps":        steps,
+        "cfg":          1.0,
+        "sampler_name": "euler",
+        "scheduler":    "simple",
+        "denoise":      1.0,
+    }}
 
-        # Prompt Upsampler subgraph node — set upsampler model name
-        if node.get("type") == "294d97c2-5179-4d93-a7ae-87b9745df54a":
-            wvn["upsampler_model"] = profile["upsampler"]
-            # sync widgets_values list: [prompt_placeholder, enable, upsampler_model]
-            wv[2] = profile["upsampler"]
+    # Decode + save
+    p["13"] = {"class_type": "VAEDecode",  "inputs": {"samples": ["12", 0], "vae": ["5", 0]}}
+    p["14"] = {"class_type": "SaveImage",  "inputs": {"images": ["13", 0], "filename_prefix": prefix}}
 
-        # Diffusion / i2i / mi2i subgraph node
-        if node.get("type") == "8f01b7ad-14bc-4b2f-a42e-8f4f861639c6":
-            wvn["seed"] = seed
-            wvn["steps"] = steps
-            wvn["unet_name"] = profile["unet"]
-            wvn["clip_name"] = profile["clip"]
-            wvn["vae_name"] = profile["vae"]
-            if width:
-                wvn["width"] = width
-            if height:
-                wvn["height"] = height
-            # sync widgets_values list order: prompt,width,height,batch,steps,alpha,seed,sampler,scheduler,unet,clip,vae
-            idx = {k: i for i, k in enumerate(["prompt", "width", "height", "batch_size",
-                                               "steps", "alpha", "seed", "sampler_name",
-                                               "scheduler", "unet_name", "clip_name", "vae_name"])}
-            wv[idx["seed"]] = seed
-            wv[idx["steps"]] = steps
-            wv[idx["unet_name"]] = profile["unet"]
-            wv[idx["clip_name"]] = profile["clip"]
-            wv[idx["vae_name"]] = profile["vae"]
-            if width:
-                wv[idx["width"]] = width
-            if height:
-                wv[idx["height"]] = height
-
-        # SaveImage prefix
-        if node.get("type") == "SaveImage":
-            wvn["filename_prefix"] = prefix
-            wv[0] = prefix
-
-        # LoadImage nodes — inject uploaded filenames
-        if node.get("type") == "LoadImage" and images:
-            title = node.get("title", "")
-            if nid == 133:  # first / only image slot in all three workflows
-                node["widgets_values"][0] = images[0]
-            elif nid == 147 and n >= 2:
-                node["widgets_values"][0] = images[1]
-            elif nid == 148 and n >= 3:
-                node["widgets_values"][0] = images[2]
-                node["mode"] = 0  # un-mute
-            elif nid == 149 and n >= 4:
-                node["widgets_values"][0] = images[3]
-                node["mode"] = 0  # un-mute
-
-    return wf
+    return p
 
 
 class Comfy:
@@ -246,14 +313,8 @@ class Comfy:
         return f"{info['subfolder']}/{info['name']}" if info.get("subfolder") else info["name"]
 
     def run(self, workflow: dict, timeout: int = 1800) -> list:
-        # FLUX.2 uses API-format (dict of nodes keyed by id).
-        # FLUX.3 uses a full graph dict (has a "nodes" key) submitted via the
-        # newer /prompt endpoint which accepts {"workflow": ..., "client_id": ...}.
-        if "nodes" in workflow:
-            payload = {"workflow": workflow, "client_id": self.client_id}
-        else:
-            payload = {"prompt": workflow, "client_id": self.client_id}
-        r = requests.post(f"{self.base}/prompt", json=payload, timeout=30)
+        r = requests.post(f"{self.base}/prompt",
+                          json={"prompt": workflow, "client_id": self.client_id}, timeout=30)
         if r.status_code != 200:
             sys.exit(f"ComfyUI rejected the workflow ({r.status_code}): {r.text}")
         prompt_id = r.json()["prompt_id"]
