@@ -195,7 +195,8 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
     p["10"] = {"class_type": "ComfyMathExpression",   "inputs": {
         "values.a": ["9", 0], "expression": "log(a)"}}
     p["11"] = {"class_type": "ModelSamplingFlux",     "inputs": {
-        "model": ["3", 0], "max_shift": ["10", 0], "base_shift": ["10", 0]}}
+        "model": ["3", 0], "max_shift": ["10", 0], "base_shift": ["10", 0],
+        "width": w, "height": h}}
 
     if n_images == 0:
         # t2i: plain empty latent
