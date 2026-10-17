@@ -211,18 +211,16 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
             "negative": ["7", 0],
             "vae":      ["5", 0],
         }
+        # ReferenceMultiLatent takes IMAGE inputs and encodes them itself with the VAE.
         for idx, img_name in enumerate(images[:4]):
-            load_id  = str(20 + idx * 3)
-            scale_id = str(21 + idx * 3)
-            enc_id   = str(22 + idx * 3)
+            load_id  = str(20 + idx * 2)
+            scale_id = str(21 + idx * 2)
             p[load_id]  = {"class_type": "LoadImage", "inputs": {
                 "image": img_name, "upload": "image"}}
             p[scale_id] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
                 "image": [load_id, 0], "upscale_method": "lanczos",
                 "megapixels": 1.0, "resolution_steps": 1}}
-            p[enc_id]   = {"class_type": "VAEEncode", "inputs": {
-                "pixels": [scale_id, 0], "vae": ["5", 0]}}
-            ref_inputs[f"images.image{idx}"] = [enc_id, 0]
+            ref_inputs[f"images.image{idx}"] = [scale_id, 0]
 
         # Output latent — use explicit size if given, otherwise 1024×1024 (images
         # are already scaled to ~1 MP by ImageScaleToTotalPixels above)
