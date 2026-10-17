@@ -1,6 +1,9 @@
 """Tiny phone-friendly web page for generating images through ComfyUI.
 
-    python server.py                  # http://127.0.0.1:8080  (ComfyUI must be running)
+    python server.py                  # http://127.0.0.1:8080
+
+If ComfyUI is already running it is used as is. Otherwise it is started when a
+request arrives and stopped again once every pending request has finished or failed.
 
 Type a prompt. If you add photos they are used as reference images (edit/restyle),
 otherwise it is a normal text-to-image generation. Everything else uses the
@@ -18,6 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -31,6 +35,39 @@ SIZES = {"square": (1024, 1024), "portrait": (832, 1216), "landscape": (1216, 83
 GEN_LOCK = threading.Lock()  # one generation at a time
 COMFY_HOST = "127.0.0.1:8188"
 
+_lease_lock = threading.Lock()
+_active = 0       # requests currently holding ComfyUI open (running or queued)
+_comfy = None     # shared Comfy; only has a process if we started it
+
+
+@contextmanager
+def comfy_lease():
+    """Keep ComfyUI up for the duration of a request.
+
+    Already running -> reuse it and never stop it. Not running -> start it for the first
+    request; it is stopped when the last overlapping request finishes or fails.
+    """
+    global _active, _comfy
+    with _lease_lock:
+        if _active == 0:
+            c = Comfy(COMFY_HOST)
+            try:
+                c.ensure_running(COMFY_HOST)  # no-op if already up
+            except SystemExit as e:  # ensure_running reports failures via sys.exit(message)
+                c.stop()
+                raise RuntimeError(str(e.code))
+            _comfy = c
+        _active += 1
+        comfy = _comfy
+    try:
+        yield comfy
+    finally:
+        with _lease_lock:
+            _active -= 1
+            if _active == 0:
+                _comfy.stop()  # does nothing if ComfyUI was already running before us
+                _comfy = None
+
 
 def installed_profiles() -> list:
     return [name for name, p in PROFILES.items()
@@ -42,10 +79,11 @@ def generate(prompt: str, profile_name: str, size: str, data_urls: list) -> list
     profile = PROFILES.get(profile_name)
     if profile is None or profile_name not in installed_profiles():
         raise RuntimeError(f"Profile '{profile_name}' is not installed.")
-    comfy = Comfy(COMFY_HOST)
-    if not comfy.is_up():
-        raise RuntimeError("ComfyUI is not running. Start it with run_comfyui.ps1.")
+    with comfy_lease() as comfy:
+        return _generate(comfy, prompt, profile_name, profile, size, data_urls)
 
+
+def _generate(comfy, prompt: str, profile_name: str, profile: dict, size: str, data_urls: list) -> list:
     seed = random.randint(0, 2**48)
     steps, cfg = profile["steps"], profile["cfg"]
     is_flux3 = profile.get("family") == "flux3"
@@ -86,84 +124,619 @@ def generate(prompt: str, profile_name: str, size: str, data_urls: list) -> list
 
 
 PAGE = r"""<!doctype html>
-<html lang="en"><head>
+<html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
-<title>Image Gen</title>
+<meta name="theme-color" content="#0d0f14">
+<title>FLUX Studio</title>
 <style>
-  :root { --bg:#111; --fg:#f2f2f2; --card:#1c1c1e; --muted:#8e8e93; --accent:#3b82f6; --danger:#ef4444; }
-  @media (prefers-color-scheme: light) { :root { --bg:#f5f5f7; --fg:#111; --card:#fff; --muted:#6b7280; } }
-  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:17px/1.4 -apple-system,system-ui,sans-serif;
-         padding:16px 16px calc(24px + env(safe-area-inset-bottom)); max-width:560px; margin-inline:auto; }
-  textarea, select { width:100%; background:var(--card); color:var(--fg); border:1px solid #8884; border-radius:14px;
-                     padding:14px; font:inherit; }
-  textarea { min-height:120px; resize:vertical; }
-  button { font:inherit; border:0; border-radius:14px; padding:14px 16px; cursor:pointer; color:var(--fg); background:var(--card); }
-  button.primary { width:100%; background:var(--accent); color:#fff; font-weight:600; margin-top:14px; padding:16px; }
-  button:disabled { opacity:.5; }
-  .row { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-  .row > * { flex:1; }
-  .chip { text-align:center; border:1px solid #8884; }
-  .chip.on { background:var(--accent); color:#fff; border-color:var(--accent); }
-  .thumbs { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
-  .thumb { position:relative; width:88px; height:88px; }
-  .thumb img { width:100%; height:100%; object-fit:cover; border-radius:12px; }
-  .thumb button { position:absolute; top:-6px; right:-6px; width:28px; height:28px; padding:0; border-radius:50%;
-                  background:var(--danger); color:#fff; line-height:28px; }
-  .hint { color:var(--muted); font-size:14px; margin-top:8px; }
-  #result img { width:100%; border-radius:14px; margin-top:16px; display:block; }
-  #result a { display:block; text-align:center; margin-top:10px; color:var(--accent); }
-  #status { margin-top:14px; text-align:center; color:var(--muted); }
-  #error { margin-top:14px; color:var(--danger); text-align:center; }
-  details { margin-top:14px; color:var(--muted); }
-  summary { cursor:pointer; }
-  details select { margin-top:8px; }
-  input[type=file] { display:none; }
-</style></head>
+  :root {
+    --bg: #090a0f;
+    --card: #13151f;
+    --card-hover: #181b28;
+    --card-subtle: #1c202f;
+    --fg: #f1f5f9;
+    --muted: #94a3b8;
+    --border: #252b3d;
+    --border-hover: #38425d;
+    --accent: #6366f1;
+    --accent-glow: rgba(99, 102, 241, 0.35);
+    --accent-gradient: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #d946ef 100%);
+    --danger: #ef4444;
+    --danger-bg: rgba(239, 68, 68, 0.12);
+    --success: #10b981;
+    --radius: 16px;
+    --radius-sm: 10px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --card-hover: #f1f5f9;
+      --card-subtle: #f1f5f9;
+      --fg: #0f172a;
+      --muted: #64748b;
+      --border: #e2e8f0;
+      --border-hover: #cbd5e1;
+      --accent: #4f46e5;
+      --accent-glow: rgba(79, 70, 229, 0.2);
+      --accent-gradient: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+      --danger: #dc2626;
+      --danger-bg: rgba(220, 38, 38, 0.08);
+      --success: #059669;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, system-ui, sans-serif;
+    line-height: 1.5;
+    padding: 20px 16px calc(32px + env(safe-area-inset-bottom));
+    max-width: 600px;
+    margin-inline: auto;
+  }
+  
+  /* App Header */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0 18px 0;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    background: var(--accent-gradient);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .brand-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    background: var(--accent-gradient);
+    border-radius: 8px;
+    color: #fff;
+    -webkit-text-fill-color: #fff;
+    font-size: 15px;
+    box-shadow: 0 4px 14px var(--accent-glow);
+  }
+  .status-pill {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--muted);
+    background: var(--card-subtle);
+    border: 1px solid var(--border);
+    padding: 5px 12px;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.2s;
+  }
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 6px var(--success);
+    transition: all 0.2s;
+  }
+  .status-dot.busy {
+    background: #f59e0b;
+    box-shadow: 0 0 8px #f59e0b;
+    animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* Main Form Panel */
+  .panel {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.12);
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  textarea {
+    width: 100%;
+    background: var(--card-subtle);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 14px;
+    font: inherit;
+    font-size: 15px;
+    min-height: 105px;
+    resize: vertical;
+    transition: border-color 0.15s, box-shadow 0.15s;
+    outline: none;
+  }
+  textarea:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  textarea::placeholder {
+    color: var(--muted);
+    opacity: 0.8;
+  }
+
+  /* Reference Photos */
+  .photo-section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .photo-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .section-label {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  .add-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    background: var(--card-subtle);
+    color: var(--fg);
+    border: 1px dashed var(--border-hover);
+    border-radius: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .add-btn:hover {
+    border-color: var(--accent);
+    background: var(--card-hover);
+  }
+  .thumbs {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .thumb {
+    position: relative;
+    width: 76px;
+    height: 76px;
+  }
+  .thumb img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+  }
+  .thumb button {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border-radius: 50%;
+    background: var(--danger);
+    color: #fff;
+    border: 2px solid var(--card);
+    font-size: 12px;
+    font-weight: bold;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+  .hint {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  /* Aspect Ratio Selector */
+  .aspect-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .aspect-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 10px 8px;
+    background: var(--card-subtle);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .aspect-btn:hover {
+    border-color: var(--border-hover);
+    color: var(--fg);
+  }
+  .aspect-btn.on {
+    background: var(--card-hover);
+    border-color: var(--accent);
+    color: var(--fg);
+    box-shadow: 0 0 0 2px var(--accent-glow);
+  }
+  .aspect-icon {
+    border: 1.5px solid currentColor;
+    border-radius: 3px;
+  }
+  .aspect-sq { width: 16px; height: 16px; }
+  .aspect-pt { width: 13px; height: 18px; }
+  .aspect-ls { width: 20px; height: 14px; }
+
+  /* Model & Engine Select */
+  details {
+    border-top: 1px solid var(--border);
+    padding-top: 12px;
+  }
+  summary {
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary::after {
+    content: "▾";
+    font-size: 12px;
+    transition: transform 0.2s;
+  }
+  details[open] summary::after {
+    transform: rotate(180deg);
+  }
+  select {
+    width: 100%;
+    margin-top: 10px;
+    background: var(--card-subtle);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    font: inherit;
+    font-size: 14px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  /* Primary Action Button */
+  .primary-btn {
+    width: 100%;
+    background: var(--accent-gradient);
+    color: #fff;
+    font-weight: 600;
+    font-size: 16px;
+    letter-spacing: 0.01em;
+    padding: 15px;
+    border: 0;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    box-shadow: 0 6px 20px var(--accent-glow);
+    transition: transform 0.1s, opacity 0.15s, box-shadow 0.15s;
+  }
+  .primary-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 25px var(--accent-glow);
+  }
+  .primary-btn:active {
+    transform: translateY(1px);
+  }
+
+  /* Form Top Error Message */
+  #formError:not(:empty) {
+    margin-top: 10px;
+    background: var(--danger-bg);
+    color: var(--danger);
+    border: 1px solid rgba(239, 68, 68, 0.2);
+    border-radius: var(--radius-sm);
+    padding: 10px 14px;
+    font-size: 13px;
+    text-align: center;
+  }
+
+  /* Feed / Queue Area */
+  .feed-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 28px;
+    margin-bottom: 14px;
+  }
+  .feed-title {
+    font-size: 14px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  .clear-btn {
+    background: transparent;
+    border: 0;
+    color: var(--muted);
+    font-size: 12px;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+  }
+  .clear-btn:hover {
+    color: var(--fg);
+    background: var(--card-subtle);
+  }
+
+  .feed {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* Job Card */
+  .job-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+    animation: slideIn 0.25s ease-out;
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .job-meta {
+    padding: 12px 16px;
+    background: var(--card);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .job-prompt {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--fg);
+    line-height: 1.4;
+    word-break: break-word;
+  }
+  .job-tags {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+  }
+  .tag {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 12px;
+    background: var(--card-subtle);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .card-close {
+    background: transparent;
+    border: 0;
+    color: var(--muted);
+    font-size: 16px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+  }
+  .card-close:hover { color: var(--danger); }
+
+  /* Processing State */
+  .job-processing {
+    padding: 28px 16px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    background: var(--card-subtle);
+  }
+  .spinner {
+    width: 24px;
+    height: 24px;
+    border: 2.5px solid var(--border-hover);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .job-status-text {
+    font-size: 14px;
+    color: var(--fg);
+    font-weight: 500;
+  }
+  .job-timer {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  /* Completed State */
+  .job-img-wrap {
+    position: relative;
+    background: #000;
+  }
+  .job-img-wrap img {
+    width: 100%;
+    height: auto;
+    display: block;
+  }
+  .job-actions {
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    background: var(--card);
+  }
+  .job-info-sub {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .job-btn-group {
+    display: flex;
+    gap: 8px;
+  }
+  .btn-sm {
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--card-subtle);
+    color: var(--fg);
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    transition: all 0.15s;
+  }
+  .btn-sm:hover {
+    border-color: var(--border-hover);
+    background: var(--card-hover);
+  }
+  .btn-primary-sm {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .btn-primary-sm:hover { opacity: 0.9; }
+
+  /* Error State */
+  .job-error {
+    padding: 20px 16px;
+    background: var(--danger-bg);
+    color: var(--danger);
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    text-align: center;
+  }
+
+  input[type=file] { display: none; }
+</style>
+</head>
 <body>
-  <textarea id="prompt" placeholder="Describe the image (or what to change in your photos)..." autofocus></textarea>
-
-  <div class="row">
-    <button id="addBtn" type="button">+ Add photos</button>
-    <input id="file" type="file" accept="image/*" multiple>
-  </div>
-  <div class="thumbs" id="thumbs"></div>
-  <div class="hint" id="hint">No photos: a new image is generated from your text.</div>
-
-  <div class="row" id="sizes">
-    <button class="chip on" data-size="square" type="button">Square</button>
-    <button class="chip" data-size="portrait" type="button">Portrait</button>
-    <button class="chip" data-size="landscape" type="button">Landscape</button>
+  <div class="header">
+    <div class="brand">
+      <div class="brand-icon">✦</div>
+      FLUX Studio
+    </div>
+    <div class="status-pill" id="globalStatus">
+      <div class="status-dot" id="globalDot"></div>
+      <span id="globalText">Ready</span>
+    </div>
   </div>
 
-  <details><summary>Model</summary><select id="profile"></select></details>
+  <div class="panel">
+    <textarea id="prompt" placeholder="Describe the image you want to create (e.g. 'a futuristic city in rain at twilight')..." autofocus></textarea>
 
-  <button class="primary" id="go" type="button">Generate</button>
-  <div id="status"></div>
-  <div id="error"></div>
-  <div id="result"></div>
+    <div class="photo-section">
+      <div class="photo-header">
+        <span class="section-label">Reference Images</span>
+        <button class="add-btn" id="addBtn" type="button">+ Add Photos</button>
+        <input id="file" type="file" accept="image/*" multiple>
+      </div>
+      <div class="thumbs" id="thumbs"></div>
+      <div class="hint" id="hint">No photos: generate fresh artwork directly from prompt.</div>
+    </div>
+
+    <div id="sizesContainer">
+      <div class="section-label" style="margin-bottom:8px">Aspect Ratio</div>
+      <div class="aspect-grid" id="sizes">
+        <button class="aspect-btn on" data-size="square" type="button">
+          <div class="aspect-icon aspect-sq"></div>
+          Square (1:1)
+        </button>
+        <button class="aspect-btn" data-size="portrait" type="button">
+          <div class="aspect-icon aspect-pt"></div>
+          Portrait (9:16)
+        </button>
+        <button class="aspect-btn" data-size="landscape" type="button">
+          <div class="aspect-icon aspect-ls"></div>
+          Landscape (16:9)
+        </button>
+      </div>
+    </div>
+
+    <details>
+      <summary>Model & Engine Profile</summary>
+      <select id="profile"></select>
+    </details>
+
+    <button class="primary-btn" id="go" type="button">
+      <span>Generate Image</span>
+      <span>✦</span>
+    </button>
+    <div id="formError"></div>
+  </div>
+
+  <div class="feed-header">
+    <span class="feed-title">Queue & Creations</span>
+    <button class="clear-btn" id="clearBtn" type="button">Clear Completed</button>
+  </div>
+
+  <div class="feed" id="feed"></div>
 
 <script>
 const MAX_IMAGES = __MAX_IMAGES__, MAX_SIDE = 1536;
 const $ = id => document.getElementById(id);
-let photos = [];            // data URLs
+let photos = [];            // data URLs for reference
 let size = "square";
+let activeJobCount = 0;
+let jobCounter = 0;
 
 fetch("/api/info").then(r => r.json()).then(info => {
   const sel = $("profile");
   info.profiles.forEach(p => { const o = new Option(p, p); sel.add(o); });
   sel.value = localStorage.profile && info.profiles.includes(localStorage.profile) ? localStorage.profile : info.default;
-  if (!info.profiles.length) $("error").textContent = "No models installed. Run download_models.py.";
+  if (!info.profiles.length) $("formError").textContent = "No models installed. Run download_models.py.";
 });
 $("profile").onchange = e => localStorage.profile = e.target.value;
-$("prompt").value = localStorage.prompt || "";
-$("prompt").oninput = e => localStorage.prompt = e.target.value;
 
-document.querySelectorAll("#sizes .chip").forEach(b => b.onclick = () => {
+document.querySelectorAll("#sizes .aspect-btn").forEach(b => b.onclick = () => {
   size = b.dataset.size;
-  document.querySelectorAll("#sizes .chip").forEach(c => c.classList.toggle("on", c === b));
+  document.querySelectorAll("#sizes .aspect-btn").forEach(c => c.classList.toggle("on", c === b));
 });
 
 $("addBtn").onclick = () => $("file").click();
@@ -194,34 +767,157 @@ function renderPhotos() {
     d.querySelector("button").onclick = () => { photos.splice(i, 1); renderPhotos(); };
     t.appendChild(d);
   });
-  $("addBtn").textContent = photos.length ? "+ Add more photos" : "+ Add photos";
+  $("addBtn").textContent = photos.length ? "+ Add more photos" : "+ Add Photos";
   $("addBtn").disabled = photos.length >= MAX_IMAGES;
-  $("sizes").style.display = photos.length ? "none" : "";
+  $("sizesContainer").style.display = photos.length ? "none" : "";
   $("hint").textContent = photos.length
     ? "Using your photo" + (photos.length > 1 ? "s (call them image 1, image 2... in the prompt)." : " as a reference.")
-    : "No photos: a new image is generated from your text.";
+    : "No photos: generate fresh artwork directly from prompt.";
 }
 
-$("go").onclick = async () => {
-  const prompt = $("prompt").value.trim();
-  if (!prompt) { $("error").textContent = "Write a prompt first."; return; }
-  $("error").textContent = ""; $("result").innerHTML = "";
-  $("go").disabled = true;
-  const t0 = Date.now();
-  const timer = setInterval(() => $("status").textContent =
-    "Generating... " + Math.round((Date.now() - t0) / 1000) + "s", 500);
-  try {
-    const r = await fetch("/api/generate", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, profile: $("profile").value, size, images: photos }) });
-    const j = await r.json();
-    if (!r.ok) throw new Error(j.error || "Failed");
-    $("result").innerHTML = j.images.map(n =>
-      `<img src="/outputs/${n}"><a href="/outputs/${n}" download>Save image</a>`).join("");
-  } catch (e) {
-    $("error").textContent = e.message;
-  } finally {
-    clearInterval(timer); $("status").textContent = ""; $("go").disabled = false;
+function updateGlobalStatus() {
+  const dot = $("globalDot");
+  const txt = $("globalText");
+  if (activeJobCount > 0) {
+    dot.className = "status-dot busy";
+    txt.textContent = activeJobCount === 1 ? "1 task generating/queued" : `${activeJobCount} tasks in queue`;
+  } else {
+    dot.className = "status-dot";
+    txt.textContent = "Ready";
   }
+}
+
+function submitRequest() {
+  const prompt = $("prompt").value.trim();
+  if (!prompt) {
+    $("formError").textContent = "Write a prompt first.";
+    $("prompt").focus();
+    return;
+  }
+  $("formError").textContent = "";
+
+  const currentProfile = $("profile").value;
+  const currentSize = size;
+  const currentPhotos = [...photos];
+  const jobId = "job_" + (++jobCounter) + "_" + Date.now();
+  const startTime = Date.now();
+
+  // Create job card in feed immediately
+  const card = document.createElement("div");
+  card.className = "job-card";
+  card.id = jobId;
+  card.innerHTML = `
+    <div class="job-meta">
+      <div>
+        <div class="job-prompt">${escapeHtml(prompt)}</div>
+        <div class="job-tags">
+          <span class="tag">${currentSize}</span>
+          <span class="tag">${currentProfile}</span>
+          ${currentPhotos.length ? `<span class="tag">${currentPhotos.length} ref photo(s)</span>` : ''}
+        </div>
+      </div>
+      <button class="card-close" title="Remove" onclick="document.getElementById('${jobId}').remove()">&times;</button>
+    </div>
+    <div class="job-processing" id="proc_${jobId}">
+      <div class="spinner"></div>
+      <div class="job-status-text">Processing image...</div>
+      <div class="job-timer" id="timer_${jobId}">Elapsed: 0s</div>
+    </div>
+    <div id="content_${jobId}"></div>
+  `;
+  $("feed").prepend(card);
+
+  activeJobCount++;
+  updateGlobalStatus();
+
+  // Keep live timer running for this specific job
+  const timer = setInterval(() => {
+    const el = $(`timer_${jobId}`);
+    if (el) {
+      el.textContent = `Elapsed: ${Math.round((Date.now() - startTime) / 1000)}s`;
+    }
+  }, 500);
+
+  // Send request in background without blocking the UI
+  fetch("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, profile: currentProfile, size: currentSize, images: currentPhotos })
+  })
+  .then(async r => {
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "Generation failed.");
+    return j;
+  })
+  .then(res => {
+    clearInterval(timer);
+    const procEl = $(`proc_${jobId}`);
+    if (procEl) procEl.remove();
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    const contentEl = $(`content_${jobId}`);
+    if (contentEl) {
+      contentEl.innerHTML = res.images.map(imgName => `
+        <div class="job-img-wrap">
+          <img src="/outputs/${imgName}" alt="Generated image">
+        </div>
+        <div class="job-actions">
+          <span class="job-info-sub">✓ Generated in ${elapsed}s</span>
+          <div class="job-btn-group">
+            <button class="btn-sm" type="button" onclick="reusePrompt('${escapeJs(prompt)}')">↺ Reuse</button>
+            <a class="btn-sm btn-primary-sm" href="/outputs/${imgName}" download>⬇ Save</a>
+          </div>
+        </div>
+      `).join("");
+    }
+  })
+  .catch(err => {
+    clearInterval(timer);
+    const procEl = $(`proc_${jobId}`);
+    if (procEl) procEl.remove();
+
+    const contentEl = $(`content_${jobId}`);
+    if (contentEl) {
+      contentEl.innerHTML = `
+        <div class="job-error">
+          <div>⚠️ ${escapeHtml(err.message)}</div>
+          <button class="btn-sm" type="button" onclick="document.getElementById('${jobId}').remove()">Dismiss</button>
+        </div>
+      `;
+    }
+  })
+  .finally(() => {
+    activeJobCount = Math.max(0, activeJobCount - 1);
+    updateGlobalStatus();
+  });
+}
+
+function reusePrompt(text) {
+  $("prompt").value = text;
+  $("prompt").focus();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function escapeJs(s) {
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n");
+}
+
+$("go").onclick = submitRequest;
+$("prompt").addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+    e.preventDefault();
+    submitRequest();
+  }
+});
+
+$("clearBtn").onclick = () => {
+  document.querySelectorAll(".job-card").forEach(c => {
+    if (!c.querySelector(".job-processing")) c.remove();
+  });
 };
 </script></body></html>
 """
@@ -284,8 +980,14 @@ def main() -> None:
     ap.add_argument("--comfy", default=COMFY_HOST, help="ComfyUI host:port")
     args = ap.parse_args()
     COMFY_HOST = args.comfy
-    print(f"Open http://{args.bind}:{args.port}  (ComfyUI at {COMFY_HOST} must be running)")
-    ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
+    print(f"Open http://{args.bind}:{args.port}  (ComfyUI is started on demand)")
+    try:
+        ThreadingHTTPServer((args.bind, args.port), Handler).serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if _comfy is not None:  # Ctrl+C mid-generation: don't leave our ComfyUI process behind
+            _comfy.stop()
 
 
 if __name__ == "__main__":

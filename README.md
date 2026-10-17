@@ -58,11 +58,11 @@ Downloads resume if interrupted. Re-run the same command.
 ## Phone-friendly web page
 A single simple page: type a prompt and tap Generate. If you add photos, they are used as reference images (edit/restyle); otherwise it is a normal text-to-image generation. Square/Portrait/Landscape and the model are the only options, and everything else uses the profile defaults.
 
-On the Windows machine that runs ComfyUI, use two terminals:
+On the Windows machine, one command:
 ```powershell
-.\run_comfyui.ps1      # terminal 1: ComfyUI on 127.0.0.1:8188
-.\run_server.ps1       # terminal 2: web page on http://127.0.0.1:8080
+.\run_server.ps1       # web page on http://127.0.0.1:8080
 ```
+If ComfyUI is already running (`.\run_comfyui.ps1`), it just uses it and never stops it. Otherwise it starts ComfyUI when a request comes in and stops it again once all pending requests have finished or failed. Overlapping requests share the one instance, so models load only once per burst.
 For private access from your phone, install [Tailscale](https://tailscale.com/download) on the PC and the phone (same account), then on the PC:
 ```powershell
 tailscale serve --bg 8080
