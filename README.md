@@ -52,7 +52,18 @@ Downloads resume if interrupted. Re-run the same command.
 .\generate.ps1 "product photo of a watch" --seed 1234
 .\generate.ps1 "..." --profile dev          # after installing the dev profile
 ```
-Options: `--profile --width --height --steps --cfg --seed --count --negative --host`. Width and height must be multiples of 16.
+Options: `--profile --image --width --height --steps --cfg --seed --count --negative --host`. Width and height must be multiples of 16.
+
+### Using a sample (reference) image
+FLUX.2 can edit or restyle an existing image. Pass `--image` and describe the change in the prompt:
+```powershell
+.\generate.ps1 "change the bag color to blue" --image bag.png
+.\generate.ps1 "stylize the handbag in image 1 with the colours and logo from image 2" --image bag.png --image logo.png
+```
+- Repeat `--image` for several references and call them "image 1", "image 2" and so on in the prompt, in the order you passed them.
+- Without `--width` or `--height`, the output matches the first image's shape at about 1 megapixel.
+- Each reference image uses extra VRAM and time, so on 16 GB keep to 1-3 images. Results are best with the `klein-*` and `dev` profiles.
+- The image is copied into `ComfyUI\input\`.
 
 ## Using it from your own Python code
 ```python
@@ -62,6 +73,12 @@ from profiles import PROFILES
 p = PROFILES["klein-4b"]
 wf = build_workflow(p, "a cat astronaut", "", 1024, 1024, seed=1, steps=p["steps"], cfg=p["cfg"], prefix="demo")
 png_bytes_list = Comfy("127.0.0.1:8188").run(wf)   # ComfyUI must be running
+
+# with a reference image:
+comfy = Comfy("127.0.0.1:8188")
+name = comfy.upload("bag.png")
+wf = build_workflow(p, "make the bag blue", "", None, None, seed=1, steps=p["steps"], cfg=p["cfg"],
+                    prefix="edit", images=[name])
 ```
 
 ## Troubleshooting

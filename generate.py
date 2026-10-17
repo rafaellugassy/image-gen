@@ -4,6 +4,8 @@ Examples:
     python generate.py "a lighthouse at dusk, cinematic"
     python generate.py "a red fox in snow" --width 1024 --height 768 --count 4
     python generate.py "a castle" --profile klein-4b-base --negative "blurry, low quality"
+    python generate.py "make the bag blue" --image bag.png            # edit / restyle a reference image
+    python generate.py "dress the cat in image 1 like image 2" --image cat.png --image style.png
 
 If ComfyUI is not already running it is started automatically (and stopped
 again when done). Start it yourself with run_comfyui.ps1 to keep models loaded
@@ -27,31 +29,65 @@ OUTPUT_DIR = ROOT / "outputs"
 LOG_DIR = ROOT / "logs"
 
 
-def build_workflow(profile: dict, prompt: str, negative: str, width: int, height: int,
-                   seed: int, steps: int, cfg: float, prefix: str) -> dict:
-    """Build a ComfyUI API-format graph equivalent to the official FLUX.2 templates."""
+def build_workflow(profile: dict, prompt: str, negative: str, width, height,
+                   seed: int, steps: int, cfg: float, prefix: str, images=None) -> dict:
+    """Build a ComfyUI API-format graph equivalent to the official FLUX.2 templates.
+
+    images: optional list of filenames already in ComfyUI's input folder (see Comfy.upload).
+    They are used as reference images for editing/restyling. If width/height are None
+    and images are given, the output size follows the first image (scaled to ~1 megapixel).
+    """
+    images = images or []
     w = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": profile["unet"], "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": profile["clip"], "type": "flux2", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": profile["vae"]}},
         "4": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["2", 0]}},
-        "5": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
-        "6": {"class_type": "Flux2Scheduler", "inputs": {"steps": steps, "width": width, "height": height}},
         "7": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
         "8": {"class_type": "RandomNoise", "inputs": {"noise_seed": seed}},
     }
 
     mode = profile["mode"]
+    # pos / neg are the conditioning outputs fed to the guider (reference images get chained on).
     if mode == "dev":
         w["9"] = {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": cfg}}
-        w["10"] = {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["9", 0]}}
+        pos, neg = ["9", 0], None
     else:
         if mode == "distilled":
             w["9"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}}
         else:  # base
             w["9"] = {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["2", 0]}}
+        pos, neg = ["4", 0], ["9", 0]
+
+    size_src = None
+    for i, name in enumerate(images):
+        load, scale, enc = f"2{i}0", f"2{i}1", f"2{i}2"
+        w[load] = {"class_type": "LoadImage", "inputs": {"image": name}}
+        w[scale] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
+            "image": [load, 0], "upscale_method": "lanczos", "megapixels": 1.0, "resolution_steps": 1}}
+        w[enc] = {"class_type": "VAEEncode", "inputs": {"pixels": [scale, 0], "vae": ["3", 0]}}
+        w[f"2{i}3"] = {"class_type": "ReferenceLatent", "inputs": {"conditioning": pos, "latent": [enc, 0]}}
+        pos = [f"2{i}3", 0]
+        if neg is not None:
+            w[f"2{i}4"] = {"class_type": "ReferenceLatent", "inputs": {"conditioning": neg, "latent": [enc, 0]}}
+            neg = [f"2{i}4", 0]
+        if size_src is None:
+            size_src = scale
+
+    if size_src is None:
+        width, height = width or 1024, height or 1024
+    elif width is None or height is None:
+        w["30"] = {"class_type": "GetImageSize", "inputs": {"image": [size_src, 0]}}
+        width, height = ["30", 0], ["30", 1]
+
+    w["5"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}}
+    w["6"] = {"class_type": "Flux2Scheduler", "inputs": {"steps": steps, "width": width, "height": height}}
+
+    if mode == "dev":
+        w["10"] = {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": pos}}
+    else:
         w["10"] = {"class_type": "CFGGuider", "inputs": {
-            "model": ["1", 0], "positive": ["4", 0], "negative": ["9", 0], "cfg": cfg}}
+            "model": ["1", 0], "positive": pos, "negative": neg, "cfg": cfg}}
 
     w["11"] = {"class_type": "SamplerCustomAdvanced", "inputs": {
         "noise": ["8", 0], "guider": ["10", 0], "sampler": ["7", 0],
@@ -107,6 +143,17 @@ class Comfy:
         if self.log:
             self.log.close()
 
+    def upload(self, path) -> str:
+        """Upload a local image to ComfyUI's input folder and return the name to reference."""
+        path = Path(path)
+        with open(path, "rb") as f:
+            r = requests.post(f"{self.base}/upload/image", files={"image": (path.name, f)},
+                              data={"type": "input"}, timeout=120)
+        if r.status_code != 200:
+            sys.exit(f"Upload of {path} failed ({r.status_code}): {r.text}")
+        info = r.json()
+        return f"{info['subfolder']}/{info['name']}" if info.get("subfolder") else info["name"]
+
     def run(self, workflow: dict, timeout: int = 1800) -> list:
         r = requests.post(f"{self.base}/prompt", json={"prompt": workflow, "client_id": self.client_id}, timeout=30)
         if r.status_code != 200:
@@ -138,8 +185,10 @@ def main() -> None:
     ap.add_argument("prompt")
     ap.add_argument("--profile", default=DEFAULT_PROFILE, choices=PROFILES)
     ap.add_argument("--negative", default="", help="negative prompt (klein-4b-base only)")
-    ap.add_argument("--width", type=int, default=1024)
-    ap.add_argument("--height", type=int, default=1024)
+    ap.add_argument("--image", action="append", default=[], metavar="PATH",
+                    help="reference image to edit/restyle; repeat for several (refer to them as 'image 1', 'image 2' in the prompt)")
+    ap.add_argument("--width", type=int, help="default 1024, or the first --image's size if given")
+    ap.add_argument("--height", type=int, help="default 1024, or the first --image's size if given")
     ap.add_argument("--steps", type=int, help="override profile default")
     ap.add_argument("--cfg", type=float, help="override profile default (guidance for dev)")
     ap.add_argument("--seed", type=int, help="random if omitted; incremented per image with --count")
@@ -148,8 +197,11 @@ def main() -> None:
     args = ap.parse_args()
 
     for dim in (args.width, args.height):
-        if dim % 16:
+        if dim is not None and dim % 16:
             sys.exit("Width and height must be multiples of 16.")
+    for img in args.image:
+        if not Path(img).is_file():
+            sys.exit(f"Reference image not found: {img}")
 
     profile = PROFILES[args.profile]
     for f in profile["files"]:
@@ -164,10 +216,11 @@ def main() -> None:
     comfy = Comfy(args.host)
     try:
         comfy.ensure_running(args.host)
+        uploaded = [comfy.upload(p) for p in args.image]
         for i in range(args.count):
             seed = base_seed + i
             wf = build_workflow(profile, args.prompt, args.negative, args.width, args.height,
-                                seed, steps, cfg, f"flux2_{args.profile}")
+                                seed, steps, cfg, f"flux2_{args.profile}", images=uploaded)
             print(f"Generating {i + 1}/{args.count} (seed {seed}) ...")
             t0 = time.time()
             for n, data in enumerate(comfy.run(wf)):
