@@ -222,12 +222,10 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
                 "pixels": [scale_id, 0], "vae": ["5", 0]}}
             ref_inputs[f"images.image{idx}"] = [enc_id, 0]
 
-        # Output size: match first image
-        p["50"] = {"class_type": "GetImageSize", "inputs": {"image": ["21", 0]}}
+        # Output latent — use explicit size if given, otherwise 1024×1024 (images
+        # are already scaled to ~1 MP by ImageScaleToTotalPixels above)
         p["51"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
-            "width":  w if width else ["50", 0],
-            "height": h if height else ["50", 1],
-            "batch_size": 1}}
+            "width": w, "height": h, "batch_size": 1}}
 
         p["52"] = {"class_type": "ReferenceMultiLatent", "inputs": ref_inputs}
         p["53"] = {"class_type": "RepeatLatentBatch", "inputs": {
