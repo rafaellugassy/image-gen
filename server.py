@@ -712,20 +712,53 @@ PAGE = r"""<!doctype html>
   </div>
 
   <div class="feed-header">
-    <span class="feed-title">Queue & Creations</span>
-    <button class="clear-btn" id="clearBtn" type="button">Clear Completed</button>
+    <span class="feed-title">Gallery & History</span>
+    <button class="clear-btn" id="clearBtn" type="button">Clear History</button>
   </div>
 
   <div class="feed" id="feed"></div>
 
 <script>
 const MAX_IMAGES = __MAX_IMAGES__, MAX_SIDE = 1536;
+const STORAGE_KEY = "flux_gallery_history";
 const $ = id => document.getElementById(id);
 let photos = [];            // data URLs for reference
 let size = "square";
 let activeJobCount = 0;
 let jobCounter = 0;
 
+// Persistent History Storage Helpers
+function getStoredHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveToHistory(item) {
+  try {
+    const list = getStoredHistory().filter(x => x.id !== item.id);
+    list.unshift(item);
+    if (list.length > 80) list.pop(); // keep last 80 items
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+  } catch (e) {}
+}
+
+function removeFromHistory(id) {
+  try {
+    const list = getStoredHistory().filter(x => x.id !== id);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
+  } catch (e) {}
+}
+
+function clearAllHistory() {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch (e) {}
+}
+
+// Initial Model Loading
 fetch("/api/info").then(r => r.json()).then(info => {
   const sel = $("profile");
   info.profiles.forEach(p => { const o = new Option(p, p); sel.add(o); });
@@ -785,6 +818,51 @@ function updateGlobalStatus() {
     dot.className = "status-dot";
     txt.textContent = "Ready";
   }
+}
+
+function renderCompletedCard(item, prepend = true) {
+  const card = document.createElement("div");
+  card.className = "job-card";
+  card.id = item.id;
+  const timeStr = item.timestamp ? new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  
+  card.innerHTML = `
+    <div class="job-meta">
+      <div>
+        <div class="job-prompt">${escapeHtml(item.prompt || item.name || 'Generated image')}</div>
+        <div class="job-tags">
+          ${item.size ? `<span class="tag">${item.size}</span>` : ''}
+          ${item.profile ? `<span class="tag">${item.profile}</span>` : ''}
+          ${timeStr ? `<span class="tag">${timeStr}</span>` : ''}
+        </div>
+      </div>
+      <button class="card-close" title="Remove from history" onclick="deleteCard('${item.id}')">&times;</button>
+    </div>
+    ${(item.images || [item.name]).map(imgName => `
+      <div class="job-img-wrap">
+        <img src="/outputs/${imgName}" alt="Generated image" loading="lazy">
+      </div>
+      <div class="job-actions">
+        <span class="job-info-sub">${item.elapsed ? `✓ ${item.elapsed}s` : imgName}</span>
+        <div class="job-btn-group">
+          ${item.prompt ? `<button class="btn-sm" type="button" onclick="reusePrompt('${escapeJs(item.prompt)}')">↺ Reuse</button>` : ''}
+          <a class="btn-sm btn-primary-sm" href="/outputs/${imgName}" download>⬇ Save</a>
+        </div>
+      </div>
+    `).join("")}
+  `;
+
+  if (prepend) {
+    $("feed").prepend(card);
+  } else {
+    $("feed").appendChild(card);
+  }
+}
+
+function deleteCard(id) {
+  const el = document.getElementById(id);
+  if (el) el.remove();
+  removeFromHistory(id);
 }
 
 function submitRequest() {
@@ -851,24 +929,24 @@ function submitRequest() {
   })
   .then(res => {
     clearInterval(timer);
-    const procEl = $(`proc_${jobId}`);
-    if (procEl) procEl.remove();
-
     const elapsed = Math.round((Date.now() - startTime) / 1000);
-    const contentEl = $(`content_${jobId}`);
-    if (contentEl) {
-      contentEl.innerHTML = res.images.map(imgName => `
-        <div class="job-img-wrap">
-          <img src="/outputs/${imgName}" alt="Generated image">
-        </div>
-        <div class="job-actions">
-          <span class="job-info-sub">✓ Generated in ${elapsed}s</span>
-          <div class="job-btn-group">
-            <button class="btn-sm" type="button" onclick="reusePrompt('${escapeJs(prompt)}')">↺ Reuse</button>
-            <a class="btn-sm btn-primary-sm" href="/outputs/${imgName}" download>⬇ Save</a>
-          </div>
-        </div>
-      `).join("");
+
+    // Save item to persistent localStorage history
+    const historyItem = {
+      id: jobId,
+      prompt,
+      profile: currentProfile,
+      size: currentSize,
+      images: res.images,
+      timestamp: Date.now(),
+      elapsed
+    };
+    saveToHistory(historyItem);
+
+    const cardEl = document.getElementById(jobId);
+    if (cardEl) {
+      cardEl.remove();
+      renderCompletedCard(historyItem, true);
     }
   })
   .catch(err => {
@@ -915,10 +993,38 @@ $("prompt").addEventListener("keydown", e => {
 });
 
 $("clearBtn").onclick = () => {
+  clearAllHistory();
   document.querySelectorAll(".job-card").forEach(c => {
     if (!c.querySelector(".job-processing")) c.remove();
   });
 };
+
+// Load saved history on startup
+function initHistory() {
+  const localItems = getStoredHistory();
+  if (localItems.length > 0) {
+    localItems.forEach(item => renderCompletedCard(item, false));
+  } else {
+    // If no localStorage, fallback to server outputs
+    fetch("/api/history")
+      .then(r => r.json())
+      .then(data => {
+        if (data.images && data.images.length) {
+          data.images.forEach(img => {
+            renderCompletedCard({
+              id: "hist_" + img.name,
+              name: img.name,
+              images: [img.name],
+              timestamp: img.time * 1000
+            }, false);
+          });
+        }
+      })
+      .catch(() => {});
+  }
+}
+
+initHistory();
 </script></body></html>
 """
 
@@ -940,6 +1046,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, page.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/info":
             self._json(200, {"profiles": installed_profiles(), "default": DEFAULT_PROFILE})
+        elif self.path == "/api/history":
+            if not OUTPUT_DIR.exists():
+                self._json(200, {"images": []})
+            else:
+                files = sorted(OUTPUT_DIR.glob("*.png"), key=lambda f: f.stat().st_mtime, reverse=True)
+                history = [{"name": f.name, "time": int(f.stat().st_mtime)} for f in files[:80]]
+                self._json(200, {"images": history})
         elif self.path.startswith("/outputs/"):
             f = OUTPUT_DIR / Path(self.path[len("/outputs/"):]).name  # .name blocks path traversal
             if f.is_file() and f.suffix == ".png":
