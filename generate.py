@@ -102,12 +102,12 @@ def build_workflow(profile: dict, prompt: str, negative: str, width, height,
     return w
 
 
-def _get_flux3_system_prompt(tpl_path: Path) -> str:
-    """Extract the t2i system prompt string from the workflow JSON."""
+def _get_flux3_system_prompt(tpl_path: Path, title: str = "System prompt: plain (t2i)") -> str:
+    """Extract a system prompt string (by node title) from the workflow JSON."""
     wf = json.loads(tpl_path.read_text(encoding="utf-8"))
     for sg in wf.get("definitions", {}).get("subgraphs", []):
         for node in sg.get("nodes", []):
-            if node.get("title") == "System prompt: plain (t2i)":
+            if node.get("title") == title:
                 wvn = node.get("widgets_values_named") or {}
                 return wvn.get("value", node.get("widgets_values", [""])[0])
     return ""
@@ -131,8 +131,15 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
     w = width or 1024
     h = height or 1024
     alpha = 16.0   # timestep shift; model reference is 6.93
-    t2i_tpl = FLUX3_WORKFLOWS / "flux3_klein_int8_t2i.json"
-    system_prompt = _get_flux3_system_prompt(t2i_tpl)
+    if n_images:
+        # Editing: the upsampler sees the photos and writes an edit instruction (as in the i2i template)
+        system_prompt = _get_flux3_system_prompt(
+            FLUX3_WORKFLOWS / "flux3_klein_int8_i2i.json", "System prompt: image edit (i2i)")
+        upsampler_prompt = ("Reference images follow in order (the first image, the second image, ...).\n"
+                            f"User request: {prompt}\nOutput the caption.")
+    else:
+        system_prompt = _get_flux3_system_prompt(FLUX3_WORKFLOWS / "flux3_klein_int8_t2i.json")
+        upsampler_prompt = prompt
 
     # ── Prompt upsampler ──────────────────────────────────────────────────────
     # 1  CLIPLoader for the upsampler LLM
@@ -158,11 +165,21 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
     p["1"] = {"class_type": "CLIPLoader", "inputs": {
         "clip_name": profile["upsampler"], "type": "flux3", "device": "default"}}
 
+    # Reference photos: load + scale (also used by the upsampler and ReferenceMultiLatent)
+    scaled = []
+    for idx, img_name in enumerate(images[:4]):
+        load_id, scale_id = str(20 + idx * 2), str(21 + idx * 2)
+        p[load_id] = {"class_type": "LoadImage", "inputs": {"image": img_name, "upload": "image"}}
+        p[scale_id] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
+            "image": [load_id, 0], "upscale_method": "lanczos",
+            "megapixels": 1.0, "resolution_steps": 16}}
+        scaled.append([scale_id, 0])
+
     # TextGenerate: upsampler LLM
     p["2"] = {"class_type": "TextGenerate", "inputs": {
         "clip": ["1", 0],
         "system_prompt": system_prompt,
-        "prompt": prompt,
+        "prompt": upsampler_prompt,
         "max_length": 3584,
         "sampling_mode": "on",
         "sampling_mode.temperature": 1,
@@ -176,6 +193,10 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
         "use_default_template": True,
         "mtp": "off",
     }}
+    if scaled:
+        p["54"] = {"class_type": "BatchImagesNode", "inputs": {
+            f"images.image{i}": s for i, s in enumerate(scaled)}}
+        p["2"]["inputs"]["image"] = ["54", 0]
 
     # Diffusion model loaders
     p["3"] = {"class_type": "UNETLoader", "inputs": {
@@ -189,6 +210,11 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
         "clip": ["4", 0], "text": ["2", 0]}}
     p["7"] = {"class_type": "CLIPTextEncode", "inputs": {
         "clip": ["4", 0], "text": ""}}
+
+    # Output size: with photos and no explicit size, follow the first photo (~1 MP)
+    if scaled and (width is None or height is None):
+        p["55"] = {"class_type": "GetImageSize", "inputs": {"image": scaled[0]}}
+        w, h = ["55", 0], ["55", 1]
 
     # Timestep shift
     p["9"]  = {"class_type": "PrimitiveFloat",        "inputs": {"value": alpha}}
@@ -215,18 +241,10 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
             "resolution.megapixels": 1.0,
         }
         # ReferenceMultiLatent takes IMAGE inputs and encodes them itself with the VAE.
-        for idx, img_name in enumerate(images[:4]):
-            load_id  = str(20 + idx * 2)
-            scale_id = str(21 + idx * 2)
-            p[load_id]  = {"class_type": "LoadImage", "inputs": {
-                "image": img_name, "upload": "image"}}
-            p[scale_id] = {"class_type": "ImageScaleToTotalPixels", "inputs": {
-                "image": [load_id, 0], "upscale_method": "lanczos",
-                "megapixels": 1.0, "resolution_steps": 1}}
-            ref_inputs[f"images.image{idx}"] = [scale_id, 0]
+        for idx, s in enumerate(scaled):
+            ref_inputs[f"images.image{idx}"] = s
 
-        # Output latent — use explicit size if given, otherwise 1024×1024 (images
-        # are already scaled to ~1 MP by ImageScaleToTotalPixels above)
+        # Output latent at the chosen size (or the first photo's size)
         p["51"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
             "width": w, "height": h, "batch_size": 1}}
 

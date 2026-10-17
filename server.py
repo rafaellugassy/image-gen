@@ -60,10 +60,10 @@ def generate(prompt: str, profile_name: str, size: str, data_urls: list) -> list
             path.write_bytes(base64.b64decode(m.group(2)))
             uploaded.append(comfy.upload(path))
 
-        # With reference images the output follows the first image's shape (flux2);
+        # With reference images the output follows the first image's shape;
         # otherwise use the chosen size preset.
         width, height = SIZES.get(size, SIZES["square"])
-        if uploaded and not is_flux3:
+        if uploaded:
             width = height = None
         if is_flux3:
             wf = build_flux3_workflow(profile, prompt, seed, steps, width, height,
