@@ -55,6 +55,20 @@ FLUX.3 automatically expands short prompts through its built-in prompt upsampler
 
 Downloads resume if interrupted. Re-run the same command.
 
+## Phone-friendly web page
+A single simple page: type a prompt and tap Generate. If you add photos, they are used as reference images (edit/restyle); otherwise it is a normal text-to-image generation. Square/Portrait/Landscape and the model are the only options, and everything else uses the profile defaults.
+
+On the Windows machine that runs ComfyUI, use two terminals:
+```powershell
+.\run_comfyui.ps1      # terminal 1: ComfyUI on 127.0.0.1:8188
+.\run_server.ps1       # terminal 2: web page on http://127.0.0.1:8080
+```
+For private access from your phone, install [Tailscale](https://tailscale.com/download) on the PC and the phone (same account), then on the PC:
+```powershell
+tailscale serve --bg 8080
+```
+Open the `https://<pc-name>.<tailnet>.ts.net` URL it prints. The server binds to localhost only and has no login of its own, so do not port-forward it or use `tailscale funnel`. Stop publishing with `tailscale serve reset`. Results are saved in `outputs\`.
+
 ## Generating
 ```powershell
 .\generate.ps1 "a red fox in snow" --count 4 --width 1024 --height 768
