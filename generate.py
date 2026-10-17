@@ -198,6 +198,7 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
         "model": ["3", 0], "max_shift": ["10", 0], "base_shift": ["10", 0],
         "width": w, "height": h}}
 
+    pos_src, neg_src = ["6", 0], ["7", 0]
     if n_images == 0:
         # t2i: plain empty latent
         p["8"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
@@ -228,16 +229,19 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
         p["51"] = {"class_type": "EmptyFlux2LatentImage", "inputs": {
             "width": w, "height": h, "batch_size": 1}}
 
+        # ReferenceMultiLatent outputs (positive, negative, empty_latent): the sampler
+        # takes its conditioning from here; the latent comes from the sized empty latent.
         p["52"] = {"class_type": "ReferenceMultiLatent", "inputs": ref_inputs}
         p["53"] = {"class_type": "RepeatLatentBatch", "inputs": {
-            "samples": ["52", 0], "amount": 1}}
+            "samples": ["51", 0], "amount": 1}}
         latent_src = ["53", 0]
+        pos_src, neg_src = ["52", 0], ["52", 1]
 
     # KSampler
     p["12"] = {"class_type": "KSampler", "inputs": {
         "model":        ["11", 0],
-        "positive":     ["6", 0],
-        "negative":     ["7", 0],
+        "positive":     pos_src,
+        "negative":     neg_src,
         "latent_image": latent_src,
         "seed":         seed,
         "steps":        steps,
