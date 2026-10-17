@@ -13,7 +13,7 @@
   .\setup.ps1                       # auto-detect GPU, klein-4b (recommended for 16 GB VRAM)
   .\setup.ps1 -Gpu amd              # force AMD (ROCm) PyTorch
   .\setup.ps1 -Gpu amd -AmdDevice device-gfx1100   # smaller download, RX 7900 XT/XTX
-  .\setup.ps1 -Profile klein-9b     # needs $env:HF_TOKEN
+  .\setup.ps1 -Profile klein-9b     # needs HF_TOKEN in .env
   .\setup.ps1 -Profile dev          # ~54 GB, needs lots of system RAM
   .\setup.ps1 -SkipModels           # install only, download models later
   .\setup.ps1 -CudaTag cu128        # NVIDIA only: if your driver is too old for cu130

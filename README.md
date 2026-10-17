@@ -37,11 +37,14 @@ Images are saved to `outputs\`. The first run is slow because the models load. L
 
 Install a different profile:
 ```powershell
-.\setup.ps1 -Profile klein-9b          # or run just the download:
-$env:HF_TOKEN = "hf_..."               # needed only for klein-9b
 .\.venv\Scripts\python download_models.py --profile klein-9b
 ```
-For `klein-9b`, first accept the terms at https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8 and create a read token at https://huggingface.co/settings/tokens.
+For `klein-9b`, first accept the terms at https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8 and create a read token at https://huggingface.co/settings/tokens. Then store the token in a git-ignored `.env` file:
+```powershell
+copy .env.example .env
+notepad .env          # replace hf_your_token_here with your token, save
+```
+`.env` is listed in `.gitignore`, so it is never committed or pushed. A real `HF_TOKEN` environment variable overrides it.
 
 Downloads resume if interrupted. Re-run the same command.
 

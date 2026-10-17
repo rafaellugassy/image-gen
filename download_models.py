@@ -4,7 +4,9 @@ Usage:
     python download_models.py --profile klein-4b
     python download_models.py --list
 
-For gated repos (klein-9b) set HF_TOKEN to a Hugging Face read token.
+For gated repos (klein-9b) provide a Hugging Face read token as HF_TOKEN, either
+in a git-ignored .env file next to this script (see .env.example) or as an
+environment variable. A real environment variable wins over .env.
 """
 import argparse
 import os
@@ -19,6 +21,21 @@ from profiles import DEFAULT_PROFILE, PROFILES
 ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "ComfyUI" / "models"
 CHUNK = 1024 * 1024
+
+
+def load_dotenv(path: Path = ROOT / ".env") -> None:
+    """Minimal .env reader: KEY=value lines, '#' comments, optional quotes."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+load_dotenv()
 
 
 def _headers(extra=None):
@@ -36,8 +53,8 @@ def download(url: str, dest: Path) -> None:
     if head.status_code in (401, 403):
         sys.exit(
             f"Access denied for {url}\n"
-            "This repo is gated. Accept its terms on huggingface.co, then set HF_TOKEN "
-            "(e.g.  $env:HF_TOKEN='hf_...' ) and re-run."
+            "This repo is gated. Accept its terms on huggingface.co, then put your token "
+            "in the .env file as HF_TOKEN=hf_... and re-run."
         )
     head.raise_for_status()
     total = int(head.headers.get("Content-Length", 0))
@@ -91,7 +108,8 @@ def main() -> None:
 
     profile = PROFILES[args.profile]
     if profile["gated"] and not os.environ.get("HF_TOKEN"):
-        sys.exit(f"Profile '{args.profile}' is gated: set HF_TOKEN to a Hugging Face read token first.")
+        sys.exit(f"Profile '{args.profile}' is gated: put HF_TOKEN=hf_... in the .env file "
+                 "(copy .env.example to .env) and re-run.")
 
     print(f"Downloading profile '{args.profile}': {profile['description']}")
     for f in profile["files"]:
