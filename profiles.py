@@ -6,6 +6,9 @@ templates. Add your own profile by copying an entry.
 
 HF = "https://huggingface.co"
 
+# FLUX.3 repo base (gated)
+_HF_FLUX3_COMFY = f"{HF}/black-forest-labs/flux-3-image-klein-comfy/resolve/main"
+
 _KLEIN_4B_TE = {
     "folder": "text_encoders",
     "name": "qwen_3_4b.safetensors",
@@ -110,6 +113,43 @@ PROFILES = {
                 "url": f"{HF}/Comfy-Org/flux2-dev/resolve/main/split_files/text_encoders/mistral_3_small_flux2_fp8.safetensors",
             },
             _FLUX2_VAE,
+        ],
+    },
+    # FLUX.3 Image Klein (int8) — 5.6B transformer + 4B VL text encoder + 9B prompt upsampler.
+    # Gated: accept terms at https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy
+    # and set HF_TOKEN. Fits 16 GB VRAM (int8 quantised). Requires ComfyUI Nodes 2.0.
+    "flux3-klein": {
+        "description": "FLUX.3 Image Klein int8 - 16 steps, prompt upsampler built-in, gated, needs HF_TOKEN",
+        "family": "flux3",
+        "mode": "distilled",
+        "steps": 16,
+        "cfg": 1.0,          # no CFG guidance; kept for API compatibility
+        "unet": "flux3-image-klein-int8-convrot.safetensors",
+        "clip": "qwen3vl_4b_int8_convrot.safetensors",
+        "upsampler": "qwen3.5_9b_flux3_prompt_upsampler_w4a8.safetensors",
+        "vae": "flux2-vae.safetensors",
+        "gated": True,
+        "files": [
+            {
+                "folder": "diffusion_models",
+                "name": "flux3-image-klein-int8-convrot.safetensors",
+                "url": f"{_HF_FLUX3_COMFY}/diffusion_models/flux3-image-klein-int8-convrot.safetensors",
+            },
+            {
+                "folder": "text_encoders",
+                "name": "qwen3vl_4b_int8_convrot.safetensors",
+                "url": f"{_HF_FLUX3_COMFY}/text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+            },
+            {
+                "folder": "text_encoders",
+                "name": "qwen3.5_9b_flux3_prompt_upsampler_w4a8.safetensors",
+                "url": f"{_HF_FLUX3_COMFY}/text_encoders/qwen3.5_9b_flux3_prompt_upsampler_w4a8.safetensors",
+            },
+            {
+                "folder": "vae",
+                "name": "flux2-vae.safetensors",
+                "url": f"{HF}/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors",
+            },
         ],
     },
 }

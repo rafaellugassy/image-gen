@@ -1,4 +1,4 @@
-"""Generate images with FLUX.2 through a local ComfyUI server.
+"""Generate images with FLUX.2 / FLUX.3 through a local ComfyUI server.
 
 Examples:
     python generate.py "a lighthouse at dusk, cinematic"
@@ -6,24 +6,30 @@ Examples:
     python generate.py "a castle" --profile klein-4b-base --negative "blurry, low quality"
     python generate.py "make the bag blue" --image bag.png            # edit / restyle a reference image
     python generate.py "dress the cat in image 1 like image 2" --image cat.png --image style.png
+    python generate.py "a lighthouse at dusk" --profile flux3-klein   # FLUX.3 with built-in prompt upsampler
 
 If ComfyUI is not already running it is started automatically (and stopped
 again when done). Start it yourself with run_comfyui.ps1 to keep models loaded
 between runs.
 """
 import argparse
+import copy
+import json
 import random
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import requests
 
 from profiles import DEFAULT_PROFILE, PROFILES
 
 ROOT = Path(__file__).resolve().parent
+FLUX3_WORKFLOWS = ROOT / "flux3_workflows"
+
 COMFY_DIR = ROOT / "ComfyUI"
 OUTPUT_DIR = ROOT / "outputs"
 LOG_DIR = ROOT / "logs"
@@ -97,6 +103,91 @@ def build_workflow(profile: dict, prompt: str, negative: str, width, height,
     return w
 
 
+def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
+                         width: Optional[int], height: Optional[int],
+                         prefix: str, images: Optional[list] = None) -> dict:
+    """Load the official FLUX.3 klein workflow JSON and inject runtime values.
+
+    images: list of filenames already uploaded to ComfyUI's input folder.
+    - 0 images → text-to-image workflow
+    - 1 image   → image-to-image workflow
+    - 2-4 images → multi-image-to-image workflow
+    """
+    images = images or []
+    n = len(images)
+    if n == 0:
+        tpl_path = FLUX3_WORKFLOWS / "flux3_klein_int8_t2i.json"
+    elif n == 1:
+        tpl_path = FLUX3_WORKFLOWS / "flux3_klein_int8_i2i.json"
+    else:
+        tpl_path = FLUX3_WORKFLOWS / "flux3_klein_int8_mi2i.json"
+
+    wf = copy.deepcopy(json.loads(tpl_path.read_text(encoding="utf-8")))
+
+    for node in wf["nodes"]:
+        nid = node["id"]
+        wvn = node.get("widgets_values_named")
+        wv = node.get("widgets_values")
+
+        # Prompt text node
+        if node.get("type") == "PrimitiveStringMultiline" and node.get("title") == "Prompt":
+            wv[0] = prompt
+            if wvn is not None:
+                wvn["STRING"] = prompt
+
+        # Prompt Upsampler subgraph node — set upsampler model name
+        if node.get("type") == "294d97c2-5179-4d93-a7ae-87b9745df54a":
+            wvn["upsampler_model"] = profile["upsampler"]
+            # sync widgets_values list: [prompt_placeholder, enable, upsampler_model]
+            wv[2] = profile["upsampler"]
+
+        # Diffusion / i2i / mi2i subgraph node
+        if node.get("type") == "8f01b7ad-14bc-4b2f-a42e-8f4f861639c6":
+            wvn["seed"] = seed
+            wvn["steps"] = steps
+            wvn["unet_name"] = profile["unet"]
+            wvn["clip_name"] = profile["clip"]
+            wvn["vae_name"] = profile["vae"]
+            if width:
+                wvn["width"] = width
+            if height:
+                wvn["height"] = height
+            # sync widgets_values list order: prompt,width,height,batch,steps,alpha,seed,sampler,scheduler,unet,clip,vae
+            idx = {k: i for i, k in enumerate(["prompt", "width", "height", "batch_size",
+                                               "steps", "alpha", "seed", "sampler_name",
+                                               "scheduler", "unet_name", "clip_name", "vae_name"])}
+            wv[idx["seed"]] = seed
+            wv[idx["steps"]] = steps
+            wv[idx["unet_name"]] = profile["unet"]
+            wv[idx["clip_name"]] = profile["clip"]
+            wv[idx["vae_name"]] = profile["vae"]
+            if width:
+                wv[idx["width"]] = width
+            if height:
+                wv[idx["height"]] = height
+
+        # SaveImage prefix
+        if node.get("type") == "SaveImage":
+            wvn["filename_prefix"] = prefix
+            wv[0] = prefix
+
+        # LoadImage nodes — inject uploaded filenames
+        if node.get("type") == "LoadImage" and images:
+            title = node.get("title", "")
+            if nid == 133:  # first / only image slot in all three workflows
+                node["widgets_values"][0] = images[0]
+            elif nid == 147 and n >= 2:
+                node["widgets_values"][0] = images[1]
+            elif nid == 148 and n >= 3:
+                node["widgets_values"][0] = images[2]
+                node["mode"] = 0  # un-mute
+            elif nid == 149 and n >= 4:
+                node["widgets_values"][0] = images[3]
+                node["mode"] = 0  # un-mute
+
+    return wf
+
+
 class Comfy:
     def __init__(self, host: str):
         self.base = f"http://{host}"
@@ -155,7 +246,14 @@ class Comfy:
         return f"{info['subfolder']}/{info['name']}" if info.get("subfolder") else info["name"]
 
     def run(self, workflow: dict, timeout: int = 1800) -> list:
-        r = requests.post(f"{self.base}/prompt", json={"prompt": workflow, "client_id": self.client_id}, timeout=30)
+        # FLUX.2 uses API-format (dict of nodes keyed by id).
+        # FLUX.3 uses a full graph dict (has a "nodes" key) submitted via the
+        # newer /prompt endpoint which accepts {"workflow": ..., "client_id": ...}.
+        if "nodes" in workflow:
+            payload = {"workflow": workflow, "client_id": self.client_id}
+        else:
+            payload = {"prompt": workflow, "client_id": self.client_id}
+        r = requests.post(f"{self.base}/prompt", json=payload, timeout=30)
         if r.status_code != 200:
             sys.exit(f"ComfyUI rejected the workflow ({r.status_code}): {r.text}")
         prompt_id = r.json()["prompt_id"]
@@ -181,7 +279,7 @@ class Comfy:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Generate images with FLUX.2 via ComfyUI")
+    ap = argparse.ArgumentParser(description="Generate images with FLUX.2 / FLUX.3 via ComfyUI")
     ap.add_argument("prompt")
     ap.add_argument("--profile", default=DEFAULT_PROFILE, choices=PROFILES)
     ap.add_argument("--negative", default="", help="negative prompt (klein-4b-base only)")
@@ -217,10 +315,19 @@ def main() -> None:
     try:
         comfy.ensure_running(args.host)
         uploaded = [comfy.upload(p) for p in args.image]
+        is_flux3 = profile.get("family") == "flux3"
+        if is_flux3:
+            print("Note: FLUX.3 uses a built-in prompt upsampler — your prompt will be "
+                  "expanded automatically before generation.")
         for i in range(args.count):
             seed = base_seed + i
-            wf = build_workflow(profile, args.prompt, args.negative, args.width, args.height,
-                                seed, steps, cfg, f"flux2_{args.profile}", images=uploaded)
+            if is_flux3:
+                wf = build_flux3_workflow(profile, args.prompt, seed, steps,
+                                          args.width, args.height,
+                                          f"flux3_{args.profile}", images=uploaded)
+            else:
+                wf = build_workflow(profile, args.prompt, args.negative, args.width, args.height,
+                                    seed, steps, cfg, f"flux2_{args.profile}", images=uploaded)
             print(f"Generating {i + 1}/{args.count} (seed {seed}) ...")
             t0 = time.time()
             for n, data in enumerate(comfy.run(wf)):

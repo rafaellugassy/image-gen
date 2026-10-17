@@ -34,6 +34,7 @@ Images are saved to `outputs\`. The first run is slow because the models load. L
 | `klein-4b-base` | klein 4B base, 20 steps, negative prompt | Easily | Apache 2.0 | More variety, slower |
 | `klein-9b` | klein 9B fp8 distilled | Yes | Non-commercial | Gated: needs `HF_TOKEN` |
 | `dev` | FLUX.2 dev fp8 (32B) | Only with CPU offload, about 64 GB system RAM | Non-commercial | About 54 GB download, slow |
+| `flux3-klein` | **FLUX.3** Image Klein int8, 16 steps | Yes | FLUX Kommunity | Gated: needs `HF_TOKEN`; built-in prompt upsampler |
 
 Install a different profile:
 ```powershell
@@ -46,6 +47,12 @@ notepad .env          # replace hf_your_token_here with your token, save
 ```
 `.env` is listed in `.gitignore`, so it is never committed or pushed. A real `HF_TOKEN` environment variable overrides it.
 
+For `flux3-klein`, accept the terms at https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy (same `HF_TOKEN` works), then:
+```powershell
+.\.venv\Scripts\python download_models.py --profile flux3-klein
+```
+FLUX.3 automatically expands short prompts through its built-in prompt upsampler before generating — you do not need to write long captions yourself. Requires ComfyUI **Nodes 2.0** (update ComfyUI first with `git pull` inside `ComfyUI\`).
+
 Downloads resume if interrupted. Re-run the same command.
 
 ## Generating
@@ -54,6 +61,7 @@ Downloads resume if interrupted. Re-run the same command.
 .\generate.ps1 "a castle on a cliff" --profile klein-4b-base --negative "blurry, low quality" --steps 30
 .\generate.ps1 "product photo of a watch" --seed 1234
 .\generate.ps1 "..." --profile dev          # after installing the dev profile
+.\generate.ps1 "a lighthouse at dusk" --profile flux3-klein   # FLUX.3 with prompt upsampler
 ```
 Options: `--profile --image --width --height --steps --cfg --seed --count --negative --host`. Width and height must be multiples of 16.
 
@@ -94,10 +102,11 @@ wf = build_workflow(p, "make the bag blue", "", None, None, seed=1, steps=p["ste
 
 ## Layout
 ```
-setup.ps1           one-shot installer
-generate.ps1/.py    CLI image generation
-run_comfyui.ps1     start ComfyUI server/web UI
-download_models.py  resumable model downloader
-profiles.py         model files and settings per profile
+setup.ps1               one-shot installer
+generate.ps1/.py        CLI image generation
+run_comfyui.ps1         start ComfyUI server/web UI
+download_models.py      resumable model downloader
+profiles.py             model files and settings per profile
+flux3_workflows/        official FLUX.3 ComfyUI workflow templates (JSON)
 ComfyUI/ .venv/ outputs/ logs/    created locally, git-ignored
 ```
