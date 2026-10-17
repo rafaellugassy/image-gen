@@ -1,11 +1,11 @@
 # FLUX.2 image generation (ComfyUI + Python) for Windows
 
-Local text-to-image using the open-weight FLUX.2 family. `setup.ps1` installs ComfyUI, PyTorch (CUDA) and the model files. `generate.py` builds the workflow, sends it to ComfyUI's HTTP API and saves the PNGs.
+Local text-to-image using the open-weight FLUX.2 family. `setup.ps1` installs ComfyUI, PyTorch (CUDA for NVIDIA, ROCm for AMD) and the model files. `generate.py` builds the workflow, sends it to ComfyUI's HTTP API and saves the PNGs.
 
 ## Requirements (Windows)
-- NVIDIA GPU with a current driver (tested target: 16 GB VRAM)
+- NVIDIA GPU with a current driver, or AMD GPU (RX 6000 series or newer) with a current Adrenalin driver on Windows 11. Target: 16 GB VRAM.
 - [Git](https://git-scm.com/download/win)
-- [Python 3.13 (64-bit)](https://www.python.org/downloads/windows/), with "Add to PATH" ticked (3.10-3.12 also work)
+- [Python 3.13 (64-bit)](https://www.python.org/downloads/windows/), with "Add to PATH" ticked. NVIDIA also works on 3.10-3.12, but **AMD requires 3.13**.
 - Disk space: about 15 GB for `klein-4b`, about 54 GB for `dev`
 
 ## Quick start
@@ -15,6 +15,15 @@ git pull
 .\generate.ps1 "a lighthouse at dusk, cinematic"
 ```
 If PowerShell blocks scripts: `powershell -ExecutionPolicy Bypass -File .\setup.ps1`
+
+### AMD GPUs
+`setup.ps1` detects your GPU and installs the matching PyTorch: CUDA for NVIDIA, ROCm for AMD. If PyTorch earlier reported that it can't find an NVIDIA driver, you have the CUDA build installed on an AMD machine. Re-run the setup. It removes the CUDA PyTorch and installs the ROCm build.
+```powershell
+.\setup.ps1 -Gpu amd                              # downloads kernels for all supported AMD GPUs
+.\setup.ps1 -Gpu amd -AmdDevice device-gfx1100    # smaller download for your GPU, e.g. RX 7900 XT/XTX
+```
+Device targets: `device-gfx1201` (RX 9070), `device-gfx1200` (RX 9060), `device-gfx1100` (RX 7900), `device-gfx1101` (RX 7700/7800), `device-gfx1102` (RX 7600), `device-gfx1151` (Ryzen AI Max).
+If the `.venv` was created with a Python other than 3.13, install 3.13, delete `.venv`, and re-run.
 
 Images are saved to `outputs\`. The first run is slow because the models load. Later runs are faster if you keep ComfyUI running in another terminal with `.\run_comfyui.ps1`, which also gives you the web UI at http://127.0.0.1:8188. `generate.py` reuses a running server and otherwise starts and stops its own.
 
@@ -56,7 +65,9 @@ png_bytes_list = Comfy("127.0.0.1:8188").run(wf)   # ComfyUI must be running
 ```
 
 ## Troubleshooting
-- **`torch.cuda.is_available()` is False.** Update your NVIDIA driver, or re-run with `.\setup.ps1 -CudaTag cu128` (or `cu126` for older drivers).
+- **`torch.cuda.is_available()` is False (NVIDIA).** Update your NVIDIA driver, or re-run with `.\setup.ps1 -CudaTag cu128` (or `cu126` for older drivers).
+- **PyTorch can't find an NVIDIA driver (AMD).** You have the CUDA build. Re-run `.\setup.ps1 -Gpu amd`.
+- **AMD: GPU not seen.** Update the Adrenalin driver and confirm you're on Windows 11 with an RDNA 2 or newer GPU (RX 6000 series or newer).
 - **Out of memory.** Use a smaller profile or resolution. `run_comfyui.ps1 --lowvram` also helps.
 - **"Missing model ..." error.** Run `download_models.py --profile <name>`.
 - **Server errors.** See `logs\comfyui.log`.
