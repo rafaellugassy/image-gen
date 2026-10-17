@@ -210,6 +210,9 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
             "positive": ["6", 0],
             "negative": ["7", 0],
             "vae":      ["5", 0],
+            # dynamic combo, template default is ("resize", 1.0)
+            "resolution": "resize",
+            "resolution.megapixels": 1.0,
         }
         # ReferenceMultiLatent takes IMAGE inputs and encodes them itself with the VAE.
         for idx, img_name in enumerate(images[:4]):
