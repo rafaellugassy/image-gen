@@ -101,7 +101,14 @@ The model itself still works at about 1 MP (1024x1024 by default, or the first `
 ### Exact size (e.g. 4000x4000) and the detail pass
 `--target WxH` gives you an image of exactly that size (up to 8192 per side). FLUX does not render 16 MP directly, so it works in two stages:
 1. Generate (or edit, with `--image`) at about 1 MP in the same aspect ratio, then upscale 4x and resize to the exact size. This is fast, and the result is sharp but has no new fine detail.
-2. With `--detail` (FLUX.3 profiles only): cut the large image into overlapping 1024x1024 tiles, re-render each tile with FLUX.3 at low denoise (0.3, 8 steps) so it adds real texture without changing the composition, then blend the tiles back together with feathered overlaps so there are no seams.
+2. With `--detail` (FLUX.3 profiles only): cut the large image into overlapping 1024x1024 tiles. For each tile:
+   - the matching region of the **new** (upscaled) image is the starting point;
+   - if you passed `--image`, the matching region of the **original photo**, zoomed in to the tile size, is given to FLUX as a reference, so it can see how that spot originally looked (for a map: the real small lettering and linework);
+   - FLUX.3's vision-language model looks at both and writes a caption of what the tile really contains, with your prompt as context (the changes are already applied, so it only describes what is in the new image);
+   - FLUX re-renders the tile at a light denoise (0.25, 8 steps, no timestep shift);
+   - colour, brightness and coarse structure are then locked back to the upscaled image, so only fine detail comes from FLUX and neighbouring tiles match.
+
+   The tiles are blended back together with feathered overlaps (192 px minimum), so there are no seams.
 ```powershell
 .\generate.ps1 "a lighthouse at dusk" --profile flux3-klein --target 4000x4000
 .\generate.ps1 "a lighthouse at dusk" --profile flux3-klein --target 4000x4000 --detail
@@ -109,7 +116,8 @@ The model itself still works at about 1 MP (1024x1024 by default, or the first `
 ```
 - Time: `--detail` adds one FLUX pass per tile. 4000x4000 is 25 tiles (they overlap so the blend is seamless), 8192x8192 is 81, so expect minutes to over an hour. Each tile runs at the normal 1 MP VRAM cost, so it fits in 16 GB.
 - Targets up to about 1.5 MP are generated directly (no upscale) when both sides are multiples of 16.
-- The prompt upsampler is skipped for tiles (it would write a different caption per tile). Tiles reuse your prompt, or a generic "ultra detailed" prompt when editing a photo.
+- Tuning, in [`hires.py`](hires.py): `REFINE_DENOISE` (default 0.25) is how much each tile is redrawn. Lower it if the result drifts from your edit, raise it if too little detail comes back from the original. `LOWFREQ_RADIUS` (default 8) is the size of detail FLUX is allowed to change. Anything coarser is taken from the upscaled image.
+- If the original photo still has things you removed (grid lines, say), a higher denoise lets FLUX copy them back from the reference. Keep the denoise low in that case.
 - The web page has the same thing: a **Resolution** selector (2K to 8K long side, or a custom WxH) and an **Add real detail** checkbox, which is only enabled for FLUX.3 profiles. The aspect-ratio buttons decide the shape, or the first photo does when you add one.
 - Needs Pillow and numpy: `.\.venv\Scripts\python -m pip install -r requirements.txt`.
 

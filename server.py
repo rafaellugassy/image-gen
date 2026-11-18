@@ -129,10 +129,11 @@ def _generate(comfy, prompt: str, profile_name: str, profile: dict, size: str, d
                 with Image.open(data_paths[0]) as im:
                     aspect = im.width / im.height
             target = _target_size(resolution, aspect)
-            from hires import render_target
+            from hires import load_reference, render_target
             try:
+                reference = load_reference(data_paths[0]) if (detail and data_paths) else None
                 png = render_target(comfy, profile, prompt, seed, steps, uploaded, target, detail,
-                                    f"web_{profile_name}", log=print)
+                                    f"web_{profile_name}", reference=reference, log=print)
             except SystemExit as e:  # Comfy.run() reports errors via sys.exit(message)
                 raise RuntimeError(str(e.code))
             OUTPUT_DIR.mkdir(exist_ok=True)

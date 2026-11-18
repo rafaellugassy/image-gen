@@ -466,12 +466,13 @@ def main() -> None:
         for i in range(args.count):
             seed = base_seed + i
             if target:
-                from hires import render_target
+                from hires import load_reference, render_target
                 print(f"Generating {i + 1}/{args.count} (seed {seed}) at {target[0]}x{target[1]} ...")
                 t0 = time.time()
+                reference = load_reference(args.image[0]) if (args.detail and args.image) else None
                 data = render_target(comfy, profile, args.prompt, seed, steps, uploaded, target,
                                      args.detail, f"{'flux3' if is_flux3 else 'flux2'}_{args.profile}",
-                                     negative=args.negative)
+                                     negative=args.negative, reference=reference)
                 path = OUTPUT_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_{args.profile}_{seed}_{target[0]}x{target[1]}.png"
                 path.write_bytes(data)
                 print(f"  saved {path.relative_to(ROOT)} ({time.time() - t0:.1f}s)")
