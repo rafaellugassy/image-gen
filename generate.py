@@ -24,7 +24,7 @@ from typing import Optional
 
 import requests
 
-from profiles import DEFAULT_PROFILE, PROFILES
+from profiles import DEFAULT_PROFILE, PROFILES, UPSCALER
 
 ROOT = Path(__file__).resolve().parent
 FLUX3_WORKFLOWS = ROOT / "flux3_workflows"
@@ -33,9 +33,45 @@ COMFY_DIR = ROOT / "ComfyUI"
 OUTPUT_DIR = ROOT / "outputs"
 LOG_DIR = ROOT / "logs"
 
+FLUX3_ALPHA = 16.0   # timestep shift; model reference is 6.93
+MAX_TARGET_SIDE = 8192
+BASE_PIXELS = 1024 * 1024   # FLUX works best around 1 MP; --target generates here, then upscales
+
+
+def base_size_for(target_w: int, target_h: int) -> tuple:
+    """~1 MP size (multiples of 16) with the same aspect ratio as the target."""
+    aspect = target_w / target_h
+    w = round((BASE_PIXELS * aspect) ** 0.5 / 16) * 16
+    h = round((BASE_PIXELS / aspect) ** 0.5 / 16) * 16
+    return max(w, 256), max(h, 256)
+
+
+def add_upscale(w: dict, image_ref: list, factor: int, target=None) -> list:
+    """Append model upscale nodes (4x, then Lanczos down to 2x or to an exact size). Returns the new image ref.
+
+    target: optional (width, height); the 4x result is resized to exactly this size
+    (centre-cropped if the aspect ratio differs slightly). ImageUpscaleWithModel works in
+    tiles, so large outputs fit in 16 GB VRAM.
+    """
+    w["90"] = {"class_type": "UpscaleModelLoader", "inputs": {"model_name": UPSCALER["name"]}}
+    w["91"] = {"class_type": "ImageUpscaleWithModel", "inputs": {
+        "upscale_model": ["90", 0], "image": image_ref}}
+    out = ["91", 0]
+    if target:
+        w["92"] = {"class_type": "ImageScale", "inputs": {
+            "image": out, "upscale_method": "lanczos",
+            "width": target[0], "height": target[1], "crop": "center"}}
+        out = ["92", 0]
+    elif factor != 4:
+        w["92"] = {"class_type": "ImageScaleBy", "inputs": {
+            "image": out, "upscale_method": "lanczos", "scale_by": factor / 4}}
+        out = ["92", 0]
+    return out
+
 
 def build_workflow(profile: dict, prompt: str, negative: str, width, height,
-                   seed: int, steps: int, cfg: float, prefix: str, images=None) -> dict:
+                   seed: int, steps: int, cfg: float, prefix: str, images=None,
+                   upscale: int = 1, target=None) -> dict:
     """Build a ComfyUI API-format graph equivalent to the official FLUX.2 templates.
 
     images: optional list of filenames already in ComfyUI's input folder (see Comfy.upload).
@@ -98,7 +134,8 @@ def build_workflow(profile: dict, prompt: str, negative: str, width, height,
         "noise": ["8", 0], "guider": ["10", 0], "sampler": ["7", 0],
         "sigmas": ["6", 0], "latent_image": ["5", 0]}}
     w["12"] = {"class_type": "VAEDecode", "inputs": {"samples": ["11", 0], "vae": ["3", 0]}}
-    w["13"] = {"class_type": "SaveImage", "inputs": {"images": ["12", 0], "filename_prefix": prefix}}
+    final = add_upscale(w, ["12", 0], upscale, target) if (upscale > 1 or target) else ["12", 0]
+    w["13"] = {"class_type": "SaveImage", "inputs": {"images": final, "filename_prefix": prefix}}
     return w
 
 
@@ -115,7 +152,8 @@ def _get_flux3_system_prompt(tpl_path: Path, title: str = "System prompt: plain 
 
 def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
                          width: Optional[int], height: Optional[int],
-                         prefix: str, images: Optional[list] = None) -> dict:
+                         prefix: str, images: Optional[list] = None, upscale: int = 1,
+                         target=None) -> dict:
     """Build a flat ComfyUI API-format prompt for FLUX.3 klein.
 
     Expands the subgraph definitions from the official workflow JSONs into
@@ -130,7 +168,7 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
     n_images = len(images)
     w = width or 1024
     h = height or 1024
-    alpha = 16.0   # timestep shift; model reference is 6.93
+    alpha = FLUX3_ALPHA
     if n_images:
         # Editing: the upsampler sees the photos and writes an edit instruction (as in the i2i template)
         system_prompt = _get_flux3_system_prompt(
@@ -272,7 +310,8 @@ def build_flux3_workflow(profile: dict, prompt: str, seed: int, steps: int,
 
     # Decode + save
     p["13"] = {"class_type": "VAEDecode",  "inputs": {"samples": ["12", 0], "vae": ["5", 0]}}
-    p["14"] = {"class_type": "SaveImage",  "inputs": {"images": ["13", 0], "filename_prefix": prefix}}
+    final = add_upscale(p, ["13", 0], upscale, target) if (upscale > 1 or target) else ["13", 0]
+    p["14"] = {"class_type": "SaveImage",  "inputs": {"images": final, "filename_prefix": prefix}}
 
     return p
 
@@ -323,12 +362,12 @@ class Comfy:
         if self.log:
             self.log.close()
 
-    def upload(self, path) -> str:
-        """Upload a local image to ComfyUI's input folder and return the name to reference."""
+    def upload(self, path, subfolder: str = "") -> str:
+        """Upload a local image to ComfyUI's input folder (or a subfolder) and return the name to reference."""
         path = Path(path)
         with open(path, "rb") as f:
             r = requests.post(f"{self.base}/upload/image", files={"image": (path.name, f)},
-                              data={"type": "input"}, timeout=120)
+                              data={"type": "input", "subfolder": subfolder}, timeout=120)
         if r.status_code != 200:
             sys.exit(f"Upload of {path} failed ({r.status_code}): {r.text}")
         info = r.json()
@@ -374,6 +413,14 @@ def main() -> None:
     ap.add_argument("--cfg", type=float, help="override profile default (guidance for dev)")
     ap.add_argument("--seed", type=int, help="random if omitted; incremented per image with --count")
     ap.add_argument("--count", type=int, default=1, help="number of images")
+    ap.add_argument("--upscale", type=int, choices=[1, 2, 4], default=1,
+                    help="upscale the result 2x or 4x in the same run (e.g. 1024x1024 -> 4096x4096)")
+    ap.add_argument("--target", metavar="WxH",
+                    help="exact output size, e.g. 4000x4000: generate at ~1 MP in the same aspect ratio, "
+                         "then upscale to this size (overrides --width/--height/--upscale)")
+    ap.add_argument("--detail", action="store_true",
+                    help="with --target (flux3 profiles): re-render ~1 MP tiles of the large image with FLUX "
+                         "at low denoise and blend them, to add real fine detail (slow)")
     ap.add_argument("--host", default="127.0.0.1:8188")
     args = ap.parse_args()
 
@@ -388,6 +435,20 @@ def main() -> None:
     for f in profile["files"]:
         if not (COMFY_DIR / "models" / f["folder"] / f["name"]).exists():
             sys.exit(f"Missing model {f['folder']}/{f['name']}. Run: python download_models.py --profile {args.profile}")
+
+    target = None
+    if args.target or args.detail:
+        if not args.target:
+            sys.exit("--detail needs --target, e.g. --target 4000x4000.")
+        from hires import parse_target
+        try:
+            target = parse_target(args.target)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        if args.detail and profile.get("family") != "flux3":
+            sys.exit("--detail needs a FLUX.3 profile (--profile flux3-klein).")
+    if (target or args.upscale > 1) and not (COMFY_DIR / "models" / UPSCALER["folder"] / UPSCALER["name"]).exists():
+        sys.exit(f"Missing upscaler {UPSCALER['folder']}/{UPSCALER['name']}. Run: python download_models.py --profile {args.profile}")
 
     base_seed = args.seed if args.seed is not None else random.randint(0, 2**48)
     steps = args.steps or profile["steps"]
@@ -404,13 +465,26 @@ def main() -> None:
                   "expanded automatically before generation.")
         for i in range(args.count):
             seed = base_seed + i
+            if target:
+                from hires import render_target
+                print(f"Generating {i + 1}/{args.count} (seed {seed}) at {target[0]}x{target[1]} ...")
+                t0 = time.time()
+                data = render_target(comfy, profile, args.prompt, seed, steps, uploaded, target,
+                                     args.detail, f"{'flux3' if is_flux3 else 'flux2'}_{args.profile}",
+                                     negative=args.negative)
+                path = OUTPUT_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}_{args.profile}_{seed}_{target[0]}x{target[1]}.png"
+                path.write_bytes(data)
+                print(f"  saved {path.relative_to(ROOT)} ({time.time() - t0:.1f}s)")
+                continue
             if is_flux3:
                 wf = build_flux3_workflow(profile, args.prompt, seed, steps,
                                           args.width, args.height,
-                                          f"flux3_{args.profile}", images=uploaded)
+                                          f"flux3_{args.profile}", images=uploaded,
+                                          upscale=args.upscale)
             else:
                 wf = build_workflow(profile, args.prompt, args.negative, args.width, args.height,
-                                    seed, steps, cfg, f"flux2_{args.profile}", images=uploaded)
+                                    seed, steps, cfg, f"flux2_{args.profile}", images=uploaded,
+                                    upscale=args.upscale)
             print(f"Generating {i + 1}/{args.count} (seed {seed}) ...")
             t0 = time.time()
             for n, data in enumerate(comfy.run(wf)):

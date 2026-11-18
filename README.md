@@ -77,7 +77,7 @@ Open the `https://<pc-name>.<tailnet>.ts.net` URL it prints. The server binds to
 .\generate.ps1 "..." --profile dev          # after installing the dev profile
 .\generate.ps1 "a lighthouse at dusk" --profile flux3-klein   # FLUX.3 with prompt upsampler
 ```
-Options: `--profile --image --width --height --steps --cfg --seed --count --negative --host`. Width and height must be multiples of 16.
+Options: `--profile --image --width --height --steps --cfg --seed --count --upscale --target --detail --negative --host`. Width and height must be multiples of 16.
 
 ### Using a sample (reference) image
 FLUX.2 can edit or restyle an existing image. Pass `--image` and describe the change in the prompt:
@@ -89,6 +89,29 @@ FLUX.2 can edit or restyle an existing image. Pass `--image` and describe the ch
 - Without `--width` or `--height`, the output matches the first image's shape at about 1 megapixel.
 - Each reference image uses extra VRAM and time, so on 16 GB keep to 1-3 images. Results are best with the `klein-*` and `dev` profiles.
 - The image is copied into `ComfyUI\input\`.
+
+### Upscaling (2x / 4x) in the same run
+`--upscale 2` or `--upscale 4` runs the result through RealESRGAN x4plus (tiled, so it fits in 16 GB) as the last step of the same workflow. It works with every profile, including `flux3-klein`, and combines with `--image` editing:
+```powershell
+.\generate.ps1 "make the sky a stormy sunset" --image photo.png --profile flux3-klein --upscale 4
+.\generate.ps1 "a lighthouse at dusk" --profile flux3-klein --upscale 2
+```
+The model itself still works at about 1 MP (1024x1024 by default, or the first `--image`'s size), then the upscale gives 2048x2048 or 4096x4096. Generating directly at huge sizes is not recommended: FLUX loses coherence and runs out of VRAM. The upscaler (`RealESRGAN_x4plus.pth`, about 67 MB) is downloaded by `download_models.py` along with the profile; re-run it for existing installs.
+
+### Exact size (e.g. 4000x4000) and the detail pass
+`--target WxH` gives you an image of exactly that size (up to 8192 per side). FLUX does not render 16 MP directly, so it works in two stages:
+1. Generate (or edit, with `--image`) at about 1 MP in the same aspect ratio, then upscale 4x and resize to the exact size. This is fast, and the result is sharp but has no new fine detail.
+2. With `--detail` (FLUX.3 profiles only): cut the large image into overlapping 1024x1024 tiles, re-render each tile with FLUX.3 at low denoise (0.3, 8 steps) so it adds real texture without changing the composition, then blend the tiles back together with feathered overlaps so there are no seams.
+```powershell
+.\generate.ps1 "a lighthouse at dusk" --profile flux3-klein --target 4000x4000
+.\generate.ps1 "a lighthouse at dusk" --profile flux3-klein --target 4000x4000 --detail
+.\generate.ps1 "make the sky a stormy sunset" --image photo.png --profile flux3-klein --target 6000x4000 --detail
+```
+- Time: `--detail` adds one FLUX pass per tile. 4000x4000 is 25 tiles (they overlap so the blend is seamless), 8192x8192 is 81, so expect minutes to over an hour. Each tile runs at the normal 1 MP VRAM cost, so it fits in 16 GB.
+- Targets up to about 1.5 MP are generated directly (no upscale) when both sides are multiples of 16.
+- The prompt upsampler is skipped for tiles (it would write a different caption per tile). Tiles reuse your prompt, or a generic "ultra detailed" prompt when editing a photo.
+- The web page has the same thing: a **Resolution** selector (2K to 8K long side, or a custom WxH) and an **Add real detail** checkbox, which is only enabled for FLUX.3 profiles. The aspect-ratio buttons decide the shape, or the first photo does when you add one.
+- Needs Pillow and numpy: `.\.venv\Scripts\python -m pip install -r requirements.txt`.
 
 ## Using it from your own Python code
 ```python

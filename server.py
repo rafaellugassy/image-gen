@@ -26,7 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from generate import COMFY_DIR, OUTPUT_DIR, Comfy, build_flux3_workflow, build_workflow
-from profiles import DEFAULT_PROFILE, PROFILES
+from profiles import DEFAULT_PROFILE, PROFILES, UPSCALER
 
 MAX_BODY = 100 * 1024 * 1024
 MAX_IMAGES = 3  # keep VRAM sane on 16 GB
@@ -74,33 +74,71 @@ def installed_profiles() -> list:
             if all((COMFY_DIR / "models" / f["folder"] / f["name"]).exists() for f in p["files"])]
 
 
-def generate(prompt: str, profile_name: str, size: str, data_urls: list) -> list:
-    """Returns the saved output filenames. Raises RuntimeError with a user-facing message."""
+def generate(prompt: str, profile_name: str, size: str, data_urls: list,
+             resolution: str = "", detail: bool = False) -> list:
+    """Returns the saved output filenames. Raises RuntimeError with a user-facing message.
+
+    resolution: "" (native ~1 MP), a long-side length such as "4096", or an exact "4000x4000".
+    detail: re-render the large image tile by tile with FLUX.3 to add fine detail (slow).
+    """
     profile = PROFILES.get(profile_name)
     if profile is None or profile_name not in installed_profiles():
         raise RuntimeError(f"Profile '{profile_name}' is not installed.")
+    if resolution:
+        if not (COMFY_DIR / "models" / UPSCALER["folder"] / UPSCALER["name"]).exists():
+            raise RuntimeError("Upscaler not installed. Run download_models.py.")
+        if detail and profile.get("family") != "flux3":
+            raise RuntimeError("Add detail needs a FLUX.3 profile.")
     with comfy_lease() as comfy:
-        return _generate(comfy, prompt, profile_name, profile, size, data_urls)
+        return _generate(comfy, prompt, profile_name, profile, size, data_urls, resolution, detail)
 
 
-def _generate(comfy, prompt: str, profile_name: str, profile: dict, size: str, data_urls: list) -> list:
+def _target_size(resolution: str, aspect: float) -> tuple:
+    from hires import parse_target, target_from_long_side
+    if "x" in resolution.lower():
+        return parse_target(resolution)
+    if not resolution.isdigit():
+        raise RuntimeError("Unknown resolution.")
+    return target_from_long_side(int(resolution), aspect)
+
+
+def _generate(comfy, prompt: str, profile_name: str, profile: dict, size: str, data_urls: list,
+              resolution: str = "", detail: bool = False) -> list:
     seed = random.randint(0, 2**48)
     steps, cfg = profile["steps"], profile["cfg"]
     is_flux3 = profile.get("family") == "flux3"
 
     with tempfile.TemporaryDirectory() as tmp, GEN_LOCK:
-        uploaded = []
+        uploaded, data_paths = [], []
         for url in data_urls:
             m = re.match(r"data:image/(png|jpeg|webp);base64,(.+)", url, re.S)
             if not m:
                 raise RuntimeError("Unsupported image.")
             path = Path(tmp) / f"web_{uuid.uuid4().hex}.{m.group(1).replace('jpeg', 'jpg')}"
             path.write_bytes(base64.b64decode(m.group(2)))
+            data_paths.append(path)
             uploaded.append(comfy.upload(path))
 
         # With reference images the output follows the first image's shape;
         # otherwise use the chosen size preset.
         width, height = SIZES.get(size, SIZES["square"])
+        if resolution:
+            aspect = width / height
+            if data_paths:
+                from PIL import Image
+                with Image.open(data_paths[0]) as im:
+                    aspect = im.width / im.height
+            target = _target_size(resolution, aspect)
+            from hires import render_target
+            try:
+                png = render_target(comfy, profile, prompt, seed, steps, uploaded, target, detail,
+                                    f"web_{profile_name}", log=print)
+            except SystemExit as e:  # Comfy.run() reports errors via sys.exit(message)
+                raise RuntimeError(str(e.code))
+            OUTPUT_DIR.mkdir(exist_ok=True)
+            name = f"{time.strftime('%Y%m%d-%H%M%S')}_{profile_name}_{seed}_{target[0]}x{target[1]}.png"
+            (OUTPUT_DIR / name).write_bytes(png)
+            return [name]
         if uploaded:
             width = height = None
         if is_flux3:
@@ -416,6 +454,17 @@ PAGE = r"""<!doctype html>
   details[open] summary::after {
     transform: rotate(180deg);
   }
+  .res-section { margin-top: 4px; }
+  .check-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .check-row input { width: 18px; height: 18px; accent-color: var(--accent, #7c5cff); }
+  .check-row.off { opacity: 0.45; cursor: not-allowed; }
   select {
     width: 100%;
     margin-top: 10px;
@@ -699,6 +748,24 @@ PAGE = r"""<!doctype html>
       </div>
     </div>
 
+    <div class="res-section">
+      <div class="section-label" style="margin-bottom:8px">Resolution</div>
+      <select id="resolution" style="margin-top:0">
+        <option value="">Native (~1 MP, fastest)</option>
+        <option value="2048">2K (2048 px long side)</option>
+        <option value="4096">4K (4096 px long side)</option>
+        <option value="6144">6K (6144 px long side)</option>
+        <option value="8192">8K (8192 px long side)</option>
+        <option value="custom">Custom size...</option>
+      </select>
+      <input id="customRes" type="text" placeholder="e.g. 4000x4000" style="display:none;margin-top:10px;width:100%;box-sizing:border-box;background:var(--card-subtle);color:var(--fg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 14px;font:inherit;font-size:14px;outline:none">
+      <label class="check-row off" id="detailRow">
+        <input type="checkbox" id="detail" disabled>
+        <span>Add real detail: re-render 1 MP tiles with FLUX and blend them (slow)</span>
+      </label>
+      <div class="hint" id="resHint" style="margin-top:6px">Generated at ~1 MP, then upscaled to the size you choose. Needs the FLUX.3 profile for the detail option.</div>
+    </div>
+
     <details>
       <summary>Model & Engine Profile</summary>
       <select id="profile"></select>
@@ -759,13 +826,25 @@ function clearAllHistory() {
 }
 
 // Initial Model Loading
+let flux3Profiles = [];
+function updateDetailOption() {
+  const resSet = !!$("resolution").value;
+  const ok = resSet && flux3Profiles.includes($("profile").value);
+  $("detail").disabled = !ok;
+  if (!ok) $("detail").checked = false;
+  $("detailRow").classList.toggle("off", !ok);
+  $("customRes").style.display = $("resolution").value === "custom" ? "" : "none";
+}
 fetch("/api/info").then(r => r.json()).then(info => {
   const sel = $("profile");
+  flux3Profiles = info.flux3 || [];
   info.profiles.forEach(p => { const o = new Option(p, p); sel.add(o); });
   sel.value = localStorage.profile && info.profiles.includes(localStorage.profile) ? localStorage.profile : info.default;
   if (!info.profiles.length) $("formError").textContent = "No models installed. Run download_models.py.";
+  updateDetailOption();
 });
-$("profile").onchange = e => localStorage.profile = e.target.value;
+$("profile").onchange = e => { localStorage.profile = e.target.value; updateDetailOption(); };
+$("resolution").onchange = updateDetailOption;
 
 document.querySelectorAll("#sizes .aspect-btn").forEach(b => b.onclick = () => {
   size = b.dataset.size;
@@ -874,6 +953,13 @@ function submitRequest() {
   }
   $("formError").textContent = "";
 
+  let resolution = $("resolution").value;
+  if (resolution === "custom") resolution = $("customRes").value.trim();
+  if ($("resolution").value === "custom" && !/^\d+\s*[xX]\s*\d+$/.test(resolution)) {
+    $("formError").textContent = "Custom size must look like 4000x4000.";
+    return;
+  }
+  const detail = $("detail").checked;
   const currentProfile = $("profile").value;
   const currentSize = size;
   const currentPhotos = [...photos];
@@ -890,6 +976,7 @@ function submitRequest() {
         <div class="job-prompt">${escapeHtml(prompt)}</div>
         <div class="job-tags">
           <span class="tag">${currentSize}</span>
+          ${resolution ? `<span class="tag">${escapeHtml(resolution)}${detail ? " + detail" : ""}</span>` : ''}
           <span class="tag">${currentProfile}</span>
           ${currentPhotos.length ? `<span class="tag">${currentPhotos.length} ref photo(s)</span>` : ''}
         </div>
@@ -920,7 +1007,7 @@ function submitRequest() {
   fetch("/api/generate", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, profile: currentProfile, size: currentSize, images: currentPhotos })
+    body: JSON.stringify({ prompt, profile: currentProfile, size: currentSize, images: currentPhotos, resolution, detail })
   })
   .then(async r => {
     const j = await r.json();
@@ -1045,7 +1132,9 @@ class Handler(BaseHTTPRequestHandler):
             page = PAGE.replace("__MAX_IMAGES__", str(MAX_IMAGES))
             self._send(200, page.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/info":
-            self._json(200, {"profiles": installed_profiles(), "default": DEFAULT_PROFILE})
+            profiles = installed_profiles()
+            self._json(200, {"profiles": profiles, "default": DEFAULT_PROFILE,
+                             "flux3": [n for n in profiles if PROFILES[n].get("family") == "flux3"]})
         elif self.path == "/api/history":
             if not OUTPUT_DIR.exists():
                 self._json(200, {"images": []})
@@ -1074,7 +1163,8 @@ class Handler(BaseHTTPRequestHandler):
             images = list(req.get("images", []))[:MAX_IMAGES]
             if not prompt:
                 return self._json(400, {"error": "Write a prompt first."})
-            names = generate(prompt, req.get("profile") or DEFAULT_PROFILE, req.get("size", "square"), images)
+            names = generate(prompt, req.get("profile") or DEFAULT_PROFILE, req.get("size", "square"), images,
+                             str(req.get("resolution", "")).strip(), bool(req.get("detail")))
             self._json(200, {"images": names})
         except RuntimeError as e:
             self._json(500, {"error": str(e)})

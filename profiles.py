@@ -155,3 +155,10 @@ PROFILES = {
 }
 
 DEFAULT_PROFILE = "klein-4b"
+
+# Optional 4x upscaler used by `generate.py --upscale 2|4` (works with every profile).
+UPSCALER = {
+    "folder": "upscale_models",
+    "name": "RealESRGAN_x4plus.pth",
+    "url": f"{HF}/lllyasviel/Annotators/resolve/main/RealESRGAN_x4plus.pth",
+}

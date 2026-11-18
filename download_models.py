@@ -16,7 +16,7 @@ from pathlib import Path
 
 import requests
 
-from profiles import DEFAULT_PROFILE, PROFILES
+from profiles import DEFAULT_PROFILE, PROFILES, UPSCALER
 
 ROOT = Path(__file__).resolve().parent
 MODELS_DIR = ROOT / "ComfyUI" / "models"
@@ -112,7 +112,7 @@ def main() -> None:
                  "(copy .env.example to .env) and re-run.")
 
     print(f"Downloading profile '{args.profile}': {profile['description']}")
-    for f in profile["files"]:
+    for f in [*profile["files"], UPSCALER]:
         print(f"- {f['folder']}/{f['name']}")
         download(f["url"], MODELS_DIR / f["folder"] / f["name"])
     print("All models ready.")
